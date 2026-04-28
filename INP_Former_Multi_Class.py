@@ -20,9 +20,88 @@ from torch.utils.data import DataLoader, ConcatDataset
 from models import vit_encoder
 from models.uad import INP_Former
 from models.vision_transformer import Mlp, Aggregation_Block, Prototype_Block
-
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import cv2
 
 warnings.filterwarnings("ignore")
+
+
+def save_heatmaps(model, dataloader, device, save_dir, item, crop_size):
+    from utils import cal_anomaly_maps, get_gaussian_kernel, denormalize, min_max_norm
+    model.eval()
+    gaussian_kernel = get_gaussian_kernel(kernel_size=5, sigma=4).to(device)
+    with torch.no_grad():
+        for img, gt, label, img_path in tqdm(dataloader, desc=f'Saving maps: {item}', ncols=80):
+            img = img.to(device)
+            output = model(img)
+            en, de = output[0], output[1]
+            anomaly_map, _ = cal_anomaly_maps(en, de, crop_size)
+            anomaly_map = gaussian_kernel(anomaly_map)
+            for i in range(img.shape[0]):
+                fname = os.path.splitext(os.path.basename(img_path[i]))[0]
+                defect_type = img_path[i].replace('\\', '/').split('/')[-2]
+                out_dir = os.path.join(save_dir, item, defect_type)
+                os.makedirs(out_dir, exist_ok=True)
+                input_img = denormalize(img[i].cpu().numpy())
+                amap = anomaly_map[i, 0].cpu().numpy()
+                amap = (amap - amap.min()) / (amap.max() - amap.min() + 1e-8)
+                plt.imsave(os.path.join(out_dir, f'{fname}_input.png'), input_img)
+                plt.imsave(os.path.join(out_dir, f'{fname}_heatmap.png'), amap, cmap='jet')
+                amap_color = (plt.cm.jet(amap)[:, :, :3] * 255).astype(np.uint8)
+                overlay = cv2.addWeighted(input_img, 0.5, amap_color, 0.5, 0)
+                plt.imsave(os.path.join(out_dir, f'{fname}_overlay.png'), overlay)
+                if label[i] == 1:
+                    gt_map = gt[i, 0].cpu().numpy()
+                    plt.imsave(os.path.join(out_dir, f'{fname}_gt.png'), gt_map, cmap='gray')
+                plt.close('all')
+
+
+def save_scores_csv(model, dataloader, device, save_dir, item, crop_size, max_ratio=0.01):
+    from utils import cal_anomaly_maps, get_gaussian_kernel
+    import csv
+    model.eval()
+    gaussian_kernel = get_gaussian_kernel(kernel_size=5, sigma=4).to(device)
+    rows = []
+    all_scores = []
+    all_labels = []
+    with torch.no_grad():
+        for img, gt, label, img_path in dataloader:
+            img = img.to(device)
+            output = model(img)
+            en, de = output[0], output[1]
+            anomaly_map, _ = cal_anomaly_maps(en, de, crop_size)
+            anomaly_map = gaussian_kernel(anomaly_map)
+            anomaly_map_flat = anomaly_map.flatten(1)
+            sp_score = torch.sort(anomaly_map_flat, dim=1, descending=True)[0][:, :int(anomaly_map_flat.shape[1] * max_ratio)]
+            sp_score = sp_score.mean(dim=1)
+            for i in range(img.shape[0]):
+                score = sp_score[i].item()
+                all_scores.append(score)
+                all_labels.append(label[i].item())
+                rows.append({
+                    'filename': os.path.basename(img_path[i]),
+                    'defect_type': img_path[i].replace('\\', '/').split('/')[-2],
+                    'anomaly_score': score,
+                    'ground_truth': 'anomaly' if label[i] == 1 else 'normal',
+                })
+    # find threshold that maximizes F1
+    from sklearn.metrics import precision_recall_curve
+    precs, recs, thrs = precision_recall_curve(all_labels, all_scores)
+    f1s = 2 * precs * recs / (precs + recs + 1e-7)
+    best_thr = thrs[np.argmax(f1s[:-1])]
+    for row in rows:
+        row['predicted'] = 'anomaly' if row['anomaly_score'] >= best_thr else 'normal'
+    out_dir = os.path.join(save_dir, 'scores')
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = os.path.join(out_dir, f'{item}_scores.csv')
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['filename', 'defect_type', 'anomaly_score', 'ground_truth', 'predicted'])
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def main(args):
     # Fixing the Random Seed
     setup_seed(1)
@@ -179,6 +258,7 @@ def main(args):
         auroc_sp_list, ap_sp_list, f1_sp_list = [], [], []
         auroc_px_list, ap_px_list, f1_px_list, aupro_px_list = [], [], [], []
         model.eval()
+        map_dir = os.path.join(args.save_dir, args.save_name, 'heatmaps')
         for item, test_data in zip(args.item_list, test_data_list):
             test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
                                                           num_workers=4)
@@ -194,6 +274,17 @@ def main(args):
             print_fn(
                 '{}: I-Auroc:{:.4f}, I-AP:{:.4f}, I-F1:{:.4f}, P-AUROC:{:.4f}, P-AP:{:.4f}, P-F1:{:.4f}, P-AUPRO:{:.4f}'.format(
                     item, auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px))
+            if args.save_maps:
+                test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
+                                                              num_workers=4)
+                save_heatmaps(model, test_dataloader, device, map_dir, item, args.crop_size)
+                print_fn(f'{item}: heatmaps saved to {map_dir}/{item}/')
+            if args.save_scores:
+                test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
+                                                              num_workers=4)
+                scores_dir = os.path.join(args.save_dir, args.save_name, 'scores')
+                save_scores_csv(model, test_dataloader, device, os.path.join(args.save_dir, args.save_name), item, args.crop_size)
+                print_fn(f'{item}: scores saved to {scores_dir}/{item}_scores.csv')
 
         print_fn(
             'Mean: I-Auroc:{:.4f}, I-AP:{:.4f}, I-F1:{:.4f}, P-AUROC:{:.4f}, P-AP:{:.4f}, P-F1:{:.4f}, P-AUPRO:{:.4f}'.format(
@@ -223,6 +314,8 @@ if __name__ == '__main__':
     parser.add_argument('--total_epochs', type=int, default=200)
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--phase', type=str, default='train')
+    parser.add_argument('--save_maps', action='store_true', help='Save anomaly heatmaps during test phase')
+    parser.add_argument('--save_scores', action='store_true', help='Save per-image anomaly scores as CSV')
 
     args = parser.parse_args()
     args.save_name = args.save_name + f'_dataset={args.dataset}_Encoder={args.encoder}_Resize={args.input_size}_Crop={args.crop_size}_INP_num={args.INP_num}'
@@ -233,8 +326,7 @@ if __name__ == '__main__':
     # category info
     if args.dataset == 'MVTec-AD':
         # args.data_path = 'E:\IMSN-LW\dataset\mvtec_anomaly_detection' # '/path/to/dataset/MVTec-AD/'
-        args.item_list = ['carpet', 'grid', 'leather', 'tile', 'wood', 'bottle', 'cable', 'capsule',
-                 'hazelnut', 'metal_nut', 'pill', 'screw', 'toothbrush', 'transistor', 'zipper']
+        args.item_list = ['can', 'fabric', 'fruit_jelly', 'rice', 'sheet_metal', 'vial', 'wallplugs', 'walnuts']
     elif args.dataset == 'VisA':
         # args.data_path = r'E:\IMSN-LW\dataset\VisA_pytorch\1cls'  # '/path/to/dataset/VisA/'
         args.item_list = ['candle', 'capsules', 'cashew', 'chewinggum', 'fryum', 'macaroni1', 'macaroni2',
