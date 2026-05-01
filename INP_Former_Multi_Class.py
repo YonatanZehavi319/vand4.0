@@ -1,3 +1,6 @@
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -8,7 +11,7 @@ from tqdm import tqdm
 from torch.nn.init import trunc_normal_
 import argparse
 from optimizers import StableAdamW
-from utils import evaluation_batch,WarmCosineScheduler, global_cosine_hm_adaptive, setup_seed, get_logger
+from utils import evaluation_batch, evaluation_batch_with_seg, WarmCosineScheduler, global_cosine_hm_adaptive, setup_seed, get_logger
 
 # Dataset-Related Modules
 from dataset import MVTecDataset, RealIADDataset
@@ -18,7 +21,7 @@ from torch.utils.data import DataLoader, ConcatDataset
 
 # Model-Related Modules
 from models import vit_encoder
-from models.uad import INP_Former
+from models.uad import INP_Former, SegHead
 from models.vision_transformer import Mlp, Aggregation_Block, Prototype_Block
 import matplotlib
 matplotlib.use('Agg')
@@ -28,9 +31,12 @@ import cv2
 warnings.filterwarnings("ignore")
 
 
-def save_heatmaps(model, dataloader, device, save_dir, item, crop_size):
+def save_heatmaps(model, dataloader, device, save_dir, item, crop_size, seg_head=None):
     from utils import cal_anomaly_maps, get_gaussian_kernel, denormalize, min_max_norm
+    from models.uad import compute_residual
     model.eval()
+    if seg_head is not None:
+        seg_head.eval()
     gaussian_kernel = get_gaussian_kernel(kernel_size=5, sigma=4).to(device)
     with torch.no_grad():
         for img, gt, label, img_path in tqdm(dataloader, desc=f'Saving maps: {item}', ncols=80):
@@ -39,6 +45,13 @@ def save_heatmaps(model, dataloader, device, save_dir, item, crop_size):
             en, de = output[0], output[1]
             anomaly_map, _ = cal_anomaly_maps(en, de, crop_size)
             anomaly_map = gaussian_kernel(anomaly_map)
+
+            # Seg head prediction if available
+            seg_pred = None
+            if seg_head is not None:
+                residual = compute_residual(en, de)
+                seg_pred = seg_head(residual, out_size=(crop_size, crop_size))
+
             for i in range(img.shape[0]):
                 fname = os.path.splitext(os.path.basename(img_path[i]))[0]
                 defect_type = img_path[i].replace('\\', '/').split('/')[-2]
@@ -52,13 +65,38 @@ def save_heatmaps(model, dataloader, device, save_dir, item, crop_size):
                 amap_color = (plt.cm.jet(amap)[:, :, :3] * 255).astype(np.uint8)
                 overlay = cv2.addWeighted(input_img, 0.5, amap_color, 0.5, 0)
                 plt.imsave(os.path.join(out_dir, f'{fname}_overlay.png'), overlay)
+
+                # Seg head binary mask (threshold at 0.5)
+                if seg_pred is not None:
+                    seg_map = seg_pred[i, 0].cpu().numpy()
+                    binary_seg = ((seg_map >= 0.5) * 255).astype(np.uint8)
+                    plt.imsave(os.path.join(out_dir, f'{fname}_binary_seg.png'), binary_seg, cmap='gray')
+                    plt.imsave(os.path.join(out_dir, f'{fname}_seg_heatmap.png'), seg_map, cmap='jet')
+
                 if label[i] == 1:
                     gt_map = gt[i, 0].cpu().numpy()
                     plt.imsave(os.path.join(out_dir, f'{fname}_gt.png'), gt_map, cmap='gray')
+
+                    # Binary prediction using Otsu threshold
+                    amap_uint8 = (amap * 255).astype(np.uint8)
+                    _, pred_mask = cv2.threshold(amap_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    gt_binary = (gt_map > 0.5).astype(np.uint8)
+                    pred_binary = (pred_mask > 127).astype(np.uint8)
+
+                    # Comparison overlay: green=TP, red=FN, blue=FP
+                    h, w = gt_binary.shape
+                    comp = input_img.copy()
+                    tp = (gt_binary == 1) & (pred_binary == 1)
+                    fn = (gt_binary == 1) & (pred_binary == 0)
+                    fp = (gt_binary == 0) & (pred_binary == 1)
+                    comp[tp] = (comp[tp] * 0.5 + np.array([0, 255, 0]) * 0.5).astype(np.uint8)   # green = correct detection
+                    comp[fn] = (comp[fn] * 0.5 + np.array([255, 0, 0]) * 0.5).astype(np.uint8)   # red = missed anomaly
+                    comp[fp] = (comp[fp] * 0.5 + np.array([0, 0, 255]) * 0.5).astype(np.uint8)   # blue = false alarm
+                    plt.imsave(os.path.join(out_dir, f'{fname}_comparison.png'), comp)
                 plt.close('all')
 
 
-def save_scores_csv(model, dataloader, device, save_dir, item, crop_size, max_ratio=0.01):
+def save_scores_csv(model, dataloader, device, save_dir, item, crop_size, max_ratio=0.01, metrics=None):
     from utils import cal_anomaly_maps, get_gaussian_kernel
     import csv
     model.eval()
@@ -97,6 +135,9 @@ def save_scores_csv(model, dataloader, device, save_dir, item, crop_size, max_ra
     os.makedirs(out_dir, exist_ok=True)
     csv_path = os.path.join(out_dir, f'{item}_scores.csv')
     with open(csv_path, 'w', newline='') as f:
+        # Write metrics header
+        if metrics:
+            f.write(f"# Metrics: {', '.join(f'{k}={v:.4f}' for k, v in metrics.items())}\n")
         writer = csv.DictWriter(f, fieldnames=['filename', 'defect_type', 'anomaly_score', 'ground_truth', 'predicted'])
         writer.writeheader()
         writer.writerows(rows)
@@ -255,6 +296,16 @@ def main(args):
     elif args.phase == 'test':
         # Test
         model.load_state_dict(torch.load(os.path.join(args.save_dir, args.save_name, 'model.pth')), strict=True)
+
+        # Load seg head if requested
+        seg_head_model = None
+        if args.seg_head:
+            seg_head_path = os.path.join(args.save_dir, args.save_name, 'seg_head.pth')
+            seg_head_model = SegHead(in_channels=embed_dim).to(device)
+            seg_head_model.load_state_dict(torch.load(seg_head_path, map_location=device))
+            seg_head_model.eval()
+            print_fn(f'Loaded seg head from {seg_head_path}')
+
         auroc_sp_list, ap_sp_list, f1_sp_list = [], [], []
         auroc_px_list, ap_px_list, f1_px_list, aupro_px_list = [], [], [], []
         model.eval()
@@ -262,7 +313,10 @@ def main(args):
         for item, test_data in zip(args.item_list, test_data_list):
             test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
                                                           num_workers=4)
-            results = evaluation_batch(model, test_dataloader, device, max_ratio=0.01, resize_mask=256)
+            if seg_head_model is not None:
+                results = evaluation_batch_with_seg(model, seg_head_model, test_dataloader, device, max_ratio=0.01, resize_mask=256)
+            else:
+                results = evaluation_batch(model, test_dataloader, device, max_ratio=0.01, resize_mask=256)
             auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px = results
             auroc_sp_list.append(auroc_sp)
             ap_sp_list.append(ap_sp)
@@ -277,13 +331,15 @@ def main(args):
             if args.save_maps:
                 test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
                                                               num_workers=4)
-                save_heatmaps(model, test_dataloader, device, map_dir, item, args.crop_size)
+                save_heatmaps(model, test_dataloader, device, map_dir, item, args.crop_size, seg_head=seg_head_model)
                 print_fn(f'{item}: heatmaps saved to {map_dir}/{item}/')
             if args.save_scores:
                 test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
                                                               num_workers=4)
                 scores_dir = os.path.join(args.save_dir, args.save_name, 'scores')
-                save_scores_csv(model, test_dataloader, device, os.path.join(args.save_dir, args.save_name), item, args.crop_size)
+                save_scores_csv(model, test_dataloader, device, os.path.join(args.save_dir, args.save_name), item, args.crop_size,
+                                metrics={'I-AUROC': auroc_sp, 'I-AP': ap_sp, 'I-F1': f1_sp,
+                                         'P-AUROC': auroc_px, 'P-AP': ap_px, 'P-F1': f1_px, 'P-AUPRO': aupro_px})
                 print_fn(f'{item}: scores saved to {scores_dir}/{item}_scores.csv')
 
         print_fn(
@@ -316,6 +372,7 @@ if __name__ == '__main__':
     parser.add_argument('--phase', type=str, default='train')
     parser.add_argument('--save_maps', action='store_true', help='Save anomaly heatmaps during test phase')
     parser.add_argument('--save_scores', action='store_true', help='Save per-image anomaly scores as CSV')
+    parser.add_argument('--seg_head', action='store_true', help='Use segmentation head during test (requires seg_head.pth)')
 
     args = parser.parse_args()
     args.save_name = args.save_name + f'_dataset={args.dataset}_Encoder={args.encoder}_Resize={args.input_size}_Crop={args.crop_size}_INP_num={args.INP_num}'

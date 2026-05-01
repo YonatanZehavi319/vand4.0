@@ -4,6 +4,40 @@ import torch.nn.functional as F
 import math
 
 
+class SegHead(nn.Module):
+    """Lightweight segmentation head for residual learning (INP-Former++ style).
+    Takes feature residual [B, C, h, w] and outputs anomaly mask [B, 1, H, W]."""
+    def __init__(self, in_channels, hidden=256):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, 3, padding=1),
+            nn.BatchNorm2d(hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, hidden // 2, 3, padding=1),
+            nn.BatchNorm2d(hidden // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden // 2, 1, 1),
+        )
+
+    def forward(self, x, out_size):
+        x = self.head(x)
+        x = F.interpolate(x, size=out_size, mode='bilinear', align_corners=True)
+        return torch.sigmoid(x)
+
+
+def compute_residual(en, de):
+    """Compute feature residual between encoder and decoder outputs (paper eq 7).
+    en, de: lists of [B, C, h, w] tensors (feature groups).
+    Returns: [B, C, h, w] residual tensor (detached from reconstruction graph)."""
+    residuals = []
+    for e, d in zip(en, de):
+        cos_sim = F.cosine_similarity(e, d, dim=1)  # [B, h, w]
+        diff = torch.abs(e - d)  # [B, C, h, w]
+        res = (1 - cos_sim).unsqueeze(1) * diff  # [B, C, h, w]
+        residuals.append(res)
+    return torch.stack(residuals).mean(0).detach()
+
+
 class INP_Former(nn.Module):
     def __init__(
             self,

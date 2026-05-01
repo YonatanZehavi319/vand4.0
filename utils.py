@@ -63,6 +63,14 @@ def ader_evaluator(pr_px, pr_sp, gt_px, gt_sp, use_metrics = ['I-AUROC', 'I-AP',
     return list(metric_results.values())
 
 
+def dice_loss(pred, target, smooth=1.0):
+    """Dice loss for binary segmentation (paper eq 8)."""
+    pred = pred.flatten(1)
+    target = target.flatten(1)
+    intersection = (pred * target).sum(1)
+    return 1 - (2 * intersection + smooth) / (pred.pow(2).sum(1) + target.pow(2).sum(1) + smooth)
+
+
 def get_logger(name, save_path=None, level='INFO'):
     logger = logging.getLogger(name)
     logger.setLevel(getattr(logging, level))
@@ -272,6 +280,68 @@ def evaluation_batch(model, dataloader, device, _class_=None, max_ratio=0, resiz
         # f1_px = f1_score_max(gt_list_px, pr_list_px)
 
     return [auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px]
+
+def evaluation_batch_with_seg(model, seg_head, dataloader, device, _class_=None, max_ratio=0, resize_mask=None):
+    """Like evaluation_batch but combines reconstruction error with seg head prediction.
+    Final anomaly map = (A_rec + M_pred) / 2  (paper eq 9)."""
+    from models.uad import compute_residual
+    model.eval()
+    seg_head.eval()
+    gt_list_px = []
+    pr_list_px = []
+    gt_list_sp = []
+    pr_list_sp = []
+    gaussian_kernel = get_gaussian_kernel(kernel_size=5, sigma=4).to(device)
+    with torch.no_grad():
+        for img, gt, label, img_path in tqdm(dataloader, ncols=80):
+            img = img.to(device)
+            output = model(img)
+            en, de = output[0], output[1]
+
+            # Reconstruction-based anomaly map
+            anomaly_map, _ = cal_anomaly_maps(en, de, img.shape[-1])
+            anomaly_map = gaussian_kernel(anomaly_map)
+
+            # Seg head prediction from feature residual
+            residual = compute_residual(en, de)
+            seg_pred = seg_head(residual, out_size=(img.shape[-1], img.shape[-1]))
+
+            # Combine: (A_rec + M_pred) / 2
+            if resize_mask is not None:
+                anomaly_map = F.interpolate(anomaly_map, size=resize_mask, mode='bilinear', align_corners=False)
+                seg_pred = F.interpolate(seg_pred, size=resize_mask, mode='bilinear', align_corners=False)
+                gt = F.interpolate(gt, size=resize_mask, mode='nearest')
+
+            # Normalize anomaly_map to [0,1] range before combining
+            a_min = anomaly_map.flatten(1).min(dim=1, keepdim=True)[0].unsqueeze(-1).unsqueeze(-1)
+            a_max = anomaly_map.flatten(1).max(dim=1, keepdim=True)[0].unsqueeze(-1).unsqueeze(-1)
+            anomaly_map_norm = (anomaly_map - a_min) / (a_max - a_min + 1e-8)
+
+            combined = (anomaly_map_norm + seg_pred) / 2
+
+            gt[gt > 0.5] = 1
+            gt[gt <= 0.5] = 0
+            if gt.shape[1] > 1:
+                gt = torch.max(gt, dim=1, keepdim=True)[0]
+            gt_list_px.append(gt)
+            pr_list_px.append(combined)
+            gt_list_sp.append(label)
+            if max_ratio == 0:
+                sp_score = torch.max(combined.flatten(1), dim=1)[0]
+            else:
+                combined_flat = combined.flatten(1)
+                sp_score = torch.sort(combined_flat, dim=1, descending=True)[0][:, :int(combined_flat.shape[1] * max_ratio)]
+                sp_score = sp_score.mean(dim=1)
+            pr_list_sp.append(sp_score)
+        gt_list_px = torch.cat(gt_list_px, dim=0)[:, 0].cpu().numpy()
+        pr_list_px = torch.cat(pr_list_px, dim=0)[:, 0].cpu().numpy()
+        gt_list_sp = torch.cat(gt_list_sp).flatten().cpu().numpy()
+        pr_list_sp = torch.cat(pr_list_sp).flatten().cpu().numpy()
+
+        auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px = ader_evaluator(pr_list_px, pr_list_sp, gt_list_px, gt_list_sp)
+
+    return [auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px]
+
 
 def evaluation_batch_vis_ZS(model, dataloader, device, _class_=None, max_ratio=0, resize_mask=None, save_root=None):
     model.eval()
