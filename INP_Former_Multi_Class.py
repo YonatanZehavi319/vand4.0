@@ -66,6 +66,11 @@ def save_heatmaps(model, dataloader, device, save_dir, item, crop_size, seg_head
                 overlay = cv2.addWeighted(input_img, 0.5, amap_color, 0.5, 0)
                 plt.imsave(os.path.join(out_dir, f'{fname}_overlay.png'), overlay)
 
+                # Otsu binary mask (saved for all images including good)
+                amap_uint8 = (amap * 255).astype(np.uint8)
+                _, pred_mask = cv2.threshold(amap_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                plt.imsave(os.path.join(out_dir, f'{fname}_binary.png'), pred_mask, cmap='gray')
+
                 # Seg head binary mask (threshold at 0.5)
                 if seg_pred is not None:
                     seg_map = seg_pred[i, 0].cpu().numpy()
@@ -77,13 +82,9 @@ def save_heatmaps(model, dataloader, device, save_dir, item, crop_size, seg_head
                     gt_map = gt[i, 0].cpu().numpy()
                     plt.imsave(os.path.join(out_dir, f'{fname}_gt.png'), gt_map, cmap='gray')
 
-                    # Binary prediction using Otsu threshold
-                    amap_uint8 = (amap * 255).astype(np.uint8)
-                    _, pred_mask = cv2.threshold(amap_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    # Comparison overlay: green=TP, red=FN, blue=FP
                     gt_binary = (gt_map > 0.5).astype(np.uint8)
                     pred_binary = (pred_mask > 127).astype(np.uint8)
-
-                    # Comparison overlay: green=TP, red=FN, blue=FP
                     h, w = gt_binary.shape
                     comp = input_img.copy()
                     tp = (gt_binary == 1) & (pred_binary == 1)
