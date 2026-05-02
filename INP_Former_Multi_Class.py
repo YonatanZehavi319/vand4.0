@@ -31,7 +31,7 @@ import cv2
 warnings.filterwarnings("ignore")
 
 
-def save_heatmaps(model, dataloader, device, save_dir, item, crop_size, seg_head=None):
+def save_heatmaps(model, dataloader, device, save_dir, item, crop_size, seg_head=None, top_percent=None):
     from utils import cal_anomaly_maps, get_gaussian_kernel, denormalize, min_max_norm
     from models.uad import compute_residual
     model.eval()
@@ -66,9 +66,13 @@ def save_heatmaps(model, dataloader, device, save_dir, item, crop_size, seg_head
                 overlay = cv2.addWeighted(input_img, 0.5, amap_color, 0.5, 0)
                 plt.imsave(os.path.join(out_dir, f'{fname}_overlay.png'), overlay)
 
-                # Otsu binary mask (saved for all images including good)
-                amap_uint8 = (amap * 255).astype(np.uint8)
-                _, pred_mask = cv2.threshold(amap_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                # Binary mask
+                if top_percent is not None:
+                    threshold = np.percentile(amap, 100 - top_percent)
+                    pred_mask = ((amap >= threshold) * 255).astype(np.uint8)
+                else:
+                    amap_uint8 = (amap * 255).astype(np.uint8)
+                    _, pred_mask = cv2.threshold(amap_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                 plt.imsave(os.path.join(out_dir, f'{fname}_binary.png'), pred_mask, cmap='gray')
 
                 # Seg head binary mask (threshold at 0.5)
@@ -332,7 +336,7 @@ def main(args):
             if args.save_maps:
                 test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
                                                               num_workers=4)
-                save_heatmaps(model, test_dataloader, device, map_dir, item, args.crop_size, seg_head=seg_head_model)
+                save_heatmaps(model, test_dataloader, device, map_dir, item, args.crop_size, seg_head=seg_head_model, top_percent=args.top_percent)
                 print_fn(f'{item}: heatmaps saved to {map_dir}/{item}/')
             if args.save_scores:
                 test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
@@ -374,6 +378,7 @@ if __name__ == '__main__':
     parser.add_argument('--save_maps', action='store_true', help='Save anomaly heatmaps during test phase')
     parser.add_argument('--save_scores', action='store_true', help='Save per-image anomaly scores as CSV')
     parser.add_argument('--seg_head', action='store_true', help='Use segmentation head during test (requires seg_head.pth)')
+    parser.add_argument('--top_percent', type=float, default=None, help='Top X%% of pixels marked as anomalous (e.g. 5). If not set, uses Otsu.')
 
     args = parser.parse_args()
     args.save_name = args.save_name + f'_dataset={args.dataset}_Encoder={args.encoder}_Resize={args.input_size}_Crop={args.crop_size}_INP_num={args.INP_num}'
