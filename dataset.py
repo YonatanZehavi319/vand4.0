@@ -23,7 +23,7 @@ class RandomLightingAugmentation:
     - Color tint and warmth
     Applied with a given probability; otherwise image is unchanged."""
 
-    def __init__(self, p=0.5, intensity_range=(0.15, 0.4)):
+    def __init__(self, p=0.5, intensity_range=(0.08, 0.2)):
         self.p = p
         self.intensity_range = intensity_range
 
@@ -38,19 +38,22 @@ class RandomLightingAugmentation:
                 grad = np.linspace(1, 0, h)[:, None].repeat(w, axis=1)
             else:
                 grad = np.linspace(0, 1, h)[:, None].repeat(w, axis=1)
-            ambient = 0.3
+            ambient = 0.6
             light_map = ambient + grad * (1.0 - ambient)
             light_map = 1.0 - intensity * (1.0 - light_map)
             img_np = img_np * light_map[:, :, None]
         elif aug == 'overexpose':
-            img_np = img_np + intensity * (255.0 - img_np)
+            # Gamma-based: preserves contrast better than linear push to 255
+            gamma = 1.0 - intensity * 0.5  # 0.9-0.96 range
+            img_np = 255.0 * (img_np / 255.0) ** gamma
         elif aug == 'underexpose':
-            img_np = img_np * (1.0 - intensity)
+            gamma = 1.0 + intensity * 0.8  # 1.06-1.16 range
+            img_np = 255.0 * (img_np / 255.0) ** gamma
         elif aug == 'tint':
-            tint = np.array([random.uniform(-1, 1), random.uniform(-1, 1), random.uniform(-1, 1)]) * intensity * 40
+            tint = np.array([random.uniform(-1, 1), random.uniform(-1, 1), random.uniform(-1, 1)]) * intensity * 20
             img_np = img_np + tint[None, None, :]
         elif aug == 'warmth':
-            warm = intensity * 25
+            warm = intensity * 12
             sign = random.choice([-1, 1])
             img_np[:, :, 0] += sign * warm       # R
             img_np[:, :, 2] -= sign * warm * 0.5  # B
