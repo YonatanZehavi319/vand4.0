@@ -104,13 +104,14 @@ def save_heatmaps(model, dataloader, device, save_dir, item, crop_size, seg_head
 def save_heatmaps_tiled(model, dataloader, device, save_dir, item, crop_size, top_percent=None):
     """Save stitched heatmaps from tiled test images."""
     from utils import cal_anomaly_maps, get_gaussian_kernel
+    import ast
     model.eval()
     gaussian_kernel = get_gaussian_kernel(kernel_size=5, sigma=4).to(device)
 
     image_tiles = {}
     with torch.no_grad():
         for batch in tqdm(dataloader, desc=f'Saving tiled maps: {item}', ncols=80):
-            tile_img, tile_gt, label, img_path, tile_idx, h, w, tile_side, stride_y, stride_x = batch
+            tile_img, tile_gt, label, img_path, tile_idx, h, w, tile_h, tile_w, n_tiles, positions_str, margin_x, margin_y = batch
             tile_img = tile_img.to(device)
             output = model(tile_img)
             en, de = output[0], output[1]
@@ -120,13 +121,16 @@ def save_heatmaps_tiled(model, dataloader, device, save_dir, item, crop_size, to
             for i in range(tile_img.shape[0]):
                 path = img_path[i]
                 tidx = tile_idx[i].item()
+                nt = n_tiles[i].item()
                 if path not in image_tiles:
+                    positions = ast.literal_eval(positions_str[i])
                     image_tiles[path] = {
-                        'maps': [None] * 4, 'gts': [None] * 4,
+                        'maps': [None] * nt, 'gts': [None] * nt,
                         'label': label[i].item(),
                         'h': h[i].item(), 'w': w[i].item(),
-                        'tile_side': tile_side[i].item(),
-                        'stride_y': stride_y[i].item(), 'stride_x': stride_x[i].item()
+                        'tile_h': tile_h[i].item(), 'tile_w': tile_w[i].item(),
+                        'positions': positions,
+                        'margin_x': margin_x[i].item(), 'margin_y': margin_y[i].item()
                     }
                 image_tiles[path]['maps'][tidx] = anomaly_map[i, 0].cpu().numpy()
                 image_tiles[path]['gts'][tidx] = tile_gt[i, 0].numpy()
@@ -137,8 +141,8 @@ def save_heatmaps_tiled(model, dataloader, device, save_dir, item, crop_size, to
         out_dir = os.path.join(save_dir, item, defect_type)
         os.makedirs(out_dir, exist_ok=True)
 
-        info = (data['h'], data['w'], data['tile_side'], data['stride_y'], data['stride_x'])
-        amap = stitch_tiles(data['maps'], *info)
+        mx, my = data['margin_x'], data['margin_y']
+        amap = stitch_tiles(data['maps'], data['h'], data['w'], data['tile_h'], data['tile_w'], data['positions'], mx, my)
         amap = (amap - amap.min()) / (amap.max() - amap.min() + 1e-8)
 
         # Save heatmap
@@ -154,7 +158,7 @@ def save_heatmaps_tiled(model, dataloader, device, save_dir, item, crop_size, to
         plt.imsave(os.path.join(out_dir, f'{fname}_binary.png'), pred_mask, cmap='gray')
 
         if data['label'] == 1:
-            gt_map = stitch_tiles(data['gts'], *info)
+            gt_map = stitch_tiles(data['gts'], data['h'], data['w'], data['tile_h'], data['tile_w'], data['positions'], mx, my)
             plt.imsave(os.path.join(out_dir, f'{fname}_gt.png'), gt_map, cmap='gray')
         plt.close('all')
 
@@ -484,7 +488,7 @@ if __name__ == '__main__':
     parser.add_argument('--top_percent', type=float, default=None, help='Top X%% of pixels marked as anomalous (e.g. 5). If not set, uses Otsu.')
     parser.add_argument('--lighting_aug', action='store_true', help='Apply random lighting augmentation during training')
     parser.add_argument('--tiling', action='store_true', help='Use 2x2 overlapping tiling for train and test')
-    parser.add_argument('--tile_overlap', type=float, default=0.5, help='Tile overlap ratio (default 0.5)')
+    parser.add_argument('--tile_overlap', type=float, default=0.2, help='Tile overlap ratio (default 0.2)')
 
     args = parser.parse_args()
     args.save_name = args.save_name + f'_dataset={args.dataset}_Encoder={args.encoder}_Resize={args.input_size}_Crop={args.crop_size}_INP_num={args.INP_num}'

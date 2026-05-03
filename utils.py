@@ -281,15 +281,20 @@ def evaluation_batch(model, dataloader, device, _class_=None, max_ratio=0, resiz
 
     return [auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px]
 
-def stitch_tiles(tile_maps, h, w, tile_side, stride_y, stride_x):
-    """Stitch 4 tile anomaly maps back into a full image by averaging overlaps."""
+def stitch_tiles(tile_maps, h, w, tile_h, tile_w, positions, margin_x=0, margin_y=0):
+    """Stitch tile anomaly maps back into a full image by averaging overlaps.
+    Crops out margins from each tile before placing."""
     full_map = np.zeros((h, w), dtype=np.float32)
     count_map = np.zeros((h, w), dtype=np.float32)
-    positions = [(0, 0), (0, stride_x), (stride_y, 0), (stride_y, stride_x)]
     for tile_map, (row, col) in zip(tile_maps, positions):
-        resized = cv2.resize(tile_map, (tile_side, tile_side))
-        full_map[row:row+tile_side, col:col+tile_side] += resized
-        count_map[row:row+tile_side, col:col+tile_side] += 1
+        # Resize to full tile size (including margins)
+        full_tile_h = tile_h + 2 * margin_y
+        full_tile_w = tile_w + 2 * margin_x
+        resized = cv2.resize(tile_map, (full_tile_w, full_tile_h))
+        # Crop out the margins to get the core tile
+        cropped = resized[margin_y:margin_y+tile_h, margin_x:margin_x+tile_w]
+        full_map[row:row+tile_h, col:col+tile_w] += cropped
+        count_map[row:row+tile_h, col:col+tile_w] += 1
     return full_map / (count_map + 1e-8)
 
 
@@ -299,11 +304,11 @@ def evaluation_batch_tiled(model, dataloader, device, max_ratio=0, resize_mask=N
     gaussian_kernel = get_gaussian_kernel(kernel_size=5, sigma=4).to(device)
 
     # Collect per-image tile results
-    image_tiles = {}  # img_path -> {'maps': [4 maps], 'gts': [4 gts], 'label': int, 'info': tuple}
+    image_tiles = {}
 
     with torch.no_grad():
         for batch in tqdm(dataloader, ncols=80):
-            tile_img, tile_gt, label, img_path, tile_idx, h, w, tile_side, stride_y, stride_x = batch
+            tile_img, tile_gt, label, img_path, tile_idx, h, w, tile_h, tile_w, n_tiles, positions_str, margin_x, margin_y = batch
             tile_img = tile_img.to(device)
             output = model(tile_img)
             en, de = output[0], output[1]
@@ -315,14 +320,18 @@ def evaluation_batch_tiled(model, dataloader, device, max_ratio=0, resize_mask=N
                 tidx = tile_idx[i].item()
                 amap = anomaly_map[i, 0].cpu().numpy()
                 gt_map = tile_gt[i, 0].numpy()
+                nt = n_tiles[i].item()
 
                 if path not in image_tiles:
+                    import ast
+                    positions = ast.literal_eval(positions_str[i])
                     image_tiles[path] = {
-                        'maps': [None] * 4, 'gts': [None] * 4,
+                        'maps': [None] * nt, 'gts': [None] * nt,
                         'label': label[i].item(),
                         'h': h[i].item(), 'w': w[i].item(),
-                        'tile_side': tile_side[i].item(),
-                        'stride_y': stride_y[i].item(), 'stride_x': stride_x[i].item()
+                        'tile_h': tile_h[i].item(), 'tile_w': tile_w[i].item(),
+                        'positions': positions,
+                        'margin_x': margin_x[i].item(), 'margin_y': margin_y[i].item()
                     }
                 image_tiles[path]['maps'][tidx] = amap
                 image_tiles[path]['gts'][tidx] = gt_map
@@ -334,9 +343,9 @@ def evaluation_batch_tiled(model, dataloader, device, max_ratio=0, resize_mask=N
     pr_list_sp = []
 
     for path, data in image_tiles.items():
-        info = (data['h'], data['w'], data['tile_side'], data['stride_y'], data['stride_x'])
-        stitched_map = stitch_tiles(data['maps'], *info)
-        stitched_gt = stitch_tiles(data['gts'], *info)
+        mx, my = data['margin_x'], data['margin_y']
+        stitched_map = stitch_tiles(data['maps'], data['h'], data['w'], data['tile_h'], data['tile_w'], data['positions'], mx, my)
+        stitched_gt = stitch_tiles(data['gts'], data['h'], data['w'], data['tile_h'], data['tile_w'], data['positions'], mx, my)
 
         if resize_mask is not None:
             stitched_map = cv2.resize(stitched_map, (resize_mask, resize_mask))
