@@ -281,6 +281,91 @@ def evaluation_batch(model, dataloader, device, _class_=None, max_ratio=0, resiz
 
     return [auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px]
 
+def stitch_tiles(tile_maps, h, w, tile_side, stride_y, stride_x):
+    """Stitch 4 tile anomaly maps back into a full image by averaging overlaps."""
+    full_map = np.zeros((h, w), dtype=np.float32)
+    count_map = np.zeros((h, w), dtype=np.float32)
+    positions = [(0, 0), (0, stride_x), (stride_y, 0), (stride_y, stride_x)]
+    for tile_map, (row, col) in zip(tile_maps, positions):
+        resized = cv2.resize(tile_map, (tile_side, tile_side))
+        full_map[row:row+tile_side, col:col+tile_side] += resized
+        count_map[row:row+tile_side, col:col+tile_side] += 1
+    return full_map / (count_map + 1e-8)
+
+
+def evaluation_batch_tiled(model, dataloader, device, max_ratio=0, resize_mask=None):
+    """Evaluate with tiled images — stitch tile predictions before computing metrics."""
+    model.eval()
+    gaussian_kernel = get_gaussian_kernel(kernel_size=5, sigma=4).to(device)
+
+    # Collect per-image tile results
+    image_tiles = {}  # img_path -> {'maps': [4 maps], 'gts': [4 gts], 'label': int, 'info': tuple}
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader, ncols=80):
+            tile_img, tile_gt, label, img_path, tile_idx, h, w, tile_side, stride_y, stride_x = batch
+            tile_img = tile_img.to(device)
+            output = model(tile_img)
+            en, de = output[0], output[1]
+            anomaly_map, _ = cal_anomaly_maps(en, de, tile_img.shape[-1])
+            anomaly_map = gaussian_kernel(anomaly_map)
+
+            for i in range(tile_img.shape[0]):
+                path = img_path[i]
+                tidx = tile_idx[i].item()
+                amap = anomaly_map[i, 0].cpu().numpy()
+                gt_map = tile_gt[i, 0].numpy()
+
+                if path not in image_tiles:
+                    image_tiles[path] = {
+                        'maps': [None] * 4, 'gts': [None] * 4,
+                        'label': label[i].item(),
+                        'h': h[i].item(), 'w': w[i].item(),
+                        'tile_side': tile_side[i].item(),
+                        'stride_y': stride_y[i].item(), 'stride_x': stride_x[i].item()
+                    }
+                image_tiles[path]['maps'][tidx] = amap
+                image_tiles[path]['gts'][tidx] = gt_map
+
+    # Stitch and compute metrics
+    gt_list_px = []
+    pr_list_px = []
+    gt_list_sp = []
+    pr_list_sp = []
+
+    for path, data in image_tiles.items():
+        info = (data['h'], data['w'], data['tile_side'], data['stride_y'], data['stride_x'])
+        stitched_map = stitch_tiles(data['maps'], *info)
+        stitched_gt = stitch_tiles(data['gts'], *info)
+
+        if resize_mask is not None:
+            stitched_map = cv2.resize(stitched_map, (resize_mask, resize_mask))
+            stitched_gt = cv2.resize(stitched_gt, (resize_mask, resize_mask))
+
+        stitched_gt[stitched_gt > 0.5] = 1
+        stitched_gt[stitched_gt <= 0.5] = 0
+
+        gt_list_px.append(stitched_gt)
+        pr_list_px.append(stitched_map)
+        gt_list_sp.append(data['label'])
+
+        if max_ratio == 0:
+            sp_score = stitched_map.max()
+        else:
+            flat = stitched_map.flatten()
+            k = max(1, int(len(flat) * max_ratio))
+            sp_score = np.sort(flat)[-k:].mean()
+        pr_list_sp.append(sp_score)
+
+    gt_list_px = np.stack(gt_list_px)
+    pr_list_px = np.stack(pr_list_px)
+    gt_list_sp = np.array(gt_list_sp)
+    pr_list_sp = np.array(pr_list_sp)
+
+    auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px = ader_evaluator(pr_list_px, pr_list_sp, gt_list_px, gt_list_sp)
+    return [auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px]
+
+
 def evaluation_batch_with_seg(model, seg_head, dataloader, device, _class_=None, max_ratio=0, resize_mask=None):
     """Like evaluation_batch but combines reconstruction error with seg head prediction.
     Final anomaly map = (A_rec + M_pred) / 2  (paper eq 9)."""

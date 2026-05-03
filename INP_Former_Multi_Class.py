@@ -11,10 +11,10 @@ from tqdm import tqdm
 from torch.nn.init import trunc_normal_
 import argparse
 from optimizers import StableAdamW
-from utils import evaluation_batch, evaluation_batch_with_seg, WarmCosineScheduler, global_cosine_hm_adaptive, setup_seed, get_logger
+from utils import evaluation_batch, evaluation_batch_with_seg, evaluation_batch_tiled, stitch_tiles, WarmCosineScheduler, global_cosine_hm_adaptive, setup_seed, get_logger
 
 # Dataset-Related Modules
-from dataset import MVTecDataset, RealIADDataset
+from dataset import MVTecDataset, RealIADDataset, TiledImageFolder, TiledMVTecDataset
 from dataset import get_data_transforms
 from torchvision.datasets import ImageFolder
 from torch.utils.data import DataLoader, ConcatDataset
@@ -101,6 +101,64 @@ def save_heatmaps(model, dataloader, device, save_dir, item, crop_size, seg_head
                 plt.close('all')
 
 
+def save_heatmaps_tiled(model, dataloader, device, save_dir, item, crop_size, top_percent=None):
+    """Save stitched heatmaps from tiled test images."""
+    from utils import cal_anomaly_maps, get_gaussian_kernel
+    model.eval()
+    gaussian_kernel = get_gaussian_kernel(kernel_size=5, sigma=4).to(device)
+
+    image_tiles = {}
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc=f'Saving tiled maps: {item}', ncols=80):
+            tile_img, tile_gt, label, img_path, tile_idx, h, w, tile_side, stride_y, stride_x = batch
+            tile_img = tile_img.to(device)
+            output = model(tile_img)
+            en, de = output[0], output[1]
+            anomaly_map, _ = cal_anomaly_maps(en, de, tile_img.shape[-1])
+            anomaly_map = gaussian_kernel(anomaly_map)
+
+            for i in range(tile_img.shape[0]):
+                path = img_path[i]
+                tidx = tile_idx[i].item()
+                if path not in image_tiles:
+                    image_tiles[path] = {
+                        'maps': [None] * 4, 'gts': [None] * 4,
+                        'label': label[i].item(),
+                        'h': h[i].item(), 'w': w[i].item(),
+                        'tile_side': tile_side[i].item(),
+                        'stride_y': stride_y[i].item(), 'stride_x': stride_x[i].item()
+                    }
+                image_tiles[path]['maps'][tidx] = anomaly_map[i, 0].cpu().numpy()
+                image_tiles[path]['gts'][tidx] = tile_gt[i, 0].numpy()
+
+    for path, data in image_tiles.items():
+        fname = os.path.splitext(os.path.basename(path))[0]
+        defect_type = path.replace('\\', '/').split('/')[-2]
+        out_dir = os.path.join(save_dir, item, defect_type)
+        os.makedirs(out_dir, exist_ok=True)
+
+        info = (data['h'], data['w'], data['tile_side'], data['stride_y'], data['stride_x'])
+        amap = stitch_tiles(data['maps'], *info)
+        amap = (amap - amap.min()) / (amap.max() - amap.min() + 1e-8)
+
+        # Save heatmap
+        plt.imsave(os.path.join(out_dir, f'{fname}_heatmap.png'), amap, cmap='jet')
+
+        # Binary mask
+        if top_percent is not None:
+            threshold = np.percentile(amap, 100 - top_percent)
+            pred_mask = ((amap >= threshold) * 255).astype(np.uint8)
+        else:
+            amap_uint8 = (amap * 255).astype(np.uint8)
+            _, pred_mask = cv2.threshold(amap_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        plt.imsave(os.path.join(out_dir, f'{fname}_binary.png'), pred_mask, cmap='gray')
+
+        if data['label'] == 1:
+            gt_map = stitch_tiles(data['gts'], *info)
+            plt.imsave(os.path.join(out_dir, f'{fname}_gt.png'), gt_map, cmap='gray')
+        plt.close('all')
+
+
 def save_scores_csv(model, dataloader, device, save_dir, item, crop_size, max_ratio=0.01, metrics=None, top_percent=None):
     from utils import cal_anomaly_maps, get_gaussian_kernel
     import csv
@@ -184,6 +242,9 @@ def main(args):
     lighting_aug = getattr(args, 'lighting_aug', False) and args.phase == 'train'
     data_transform, gt_transform = get_data_transforms(args.input_size, args.crop_size, lighting_aug=lighting_aug)
 
+    use_tiling = getattr(args, 'tiling', False)
+    tile_overlap = getattr(args, 'tile_overlap', 0.5)
+
     if args.dataset == 'MVTec-AD' or args.dataset == 'VisA':
         train_data_list = []
         test_data_list = []
@@ -191,11 +252,15 @@ def main(args):
             train_path = os.path.join(args.data_path, item, 'train')
             test_path = os.path.join(args.data_path, item)
 
-            train_data = ImageFolder(root=train_path, transform=data_transform)
-            train_data.classes = item
-            train_data.class_to_idx = {item: i}
-            train_data.samples = [(sample[0], i) for sample in train_data.samples]
-            test_data = MVTecDataset(root=test_path, transform=data_transform, gt_transform=gt_transform, phase="test")
+            if use_tiling:
+                train_data = TiledImageFolder(root=train_path, transform=data_transform, overlap=tile_overlap)
+                test_data = TiledMVTecDataset(root=test_path, transform=data_transform, gt_transform=gt_transform, phase="test", overlap=tile_overlap)
+            else:
+                train_data = ImageFolder(root=train_path, transform=data_transform)
+                train_data.classes = item
+                train_data.class_to_idx = {item: i}
+                train_data.samples = [(sample[0], i) for sample in train_data.samples]
+                test_data = MVTecDataset(root=test_path, transform=data_transform, gt_transform=gt_transform, phase="test")
             train_data_list.append(train_data)
             test_data_list.append(test_data)
         train_data = ConcatDataset(train_data_list)
@@ -347,7 +412,9 @@ def main(args):
         for item, test_data in zip(args.item_list, test_data_list):
             test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
                                                           num_workers=4)
-            if seg_head_model is not None:
+            if use_tiling:
+                results = evaluation_batch_tiled(model, test_dataloader, device, max_ratio=0.01, resize_mask=256)
+            elif seg_head_model is not None:
                 results = evaluation_batch_with_seg(model, seg_head_model, test_dataloader, device, max_ratio=0.01, resize_mask=256)
             else:
                 results = evaluation_batch(model, test_dataloader, device, max_ratio=0.01, resize_mask=256)
@@ -365,7 +432,10 @@ def main(args):
             if args.save_maps:
                 test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
                                                               num_workers=4)
-                save_heatmaps(model, test_dataloader, device, map_dir, item, args.crop_size, seg_head=seg_head_model, top_percent=args.top_percent)
+                if use_tiling:
+                    save_heatmaps_tiled(model, test_dataloader, device, map_dir, item, args.crop_size, top_percent=args.top_percent)
+                else:
+                    save_heatmaps(model, test_dataloader, device, map_dir, item, args.crop_size, seg_head=seg_head_model, top_percent=args.top_percent)
                 print_fn(f'{item}: heatmaps saved to {map_dir}/{item}/')
             if args.save_scores:
                 test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
@@ -410,6 +480,8 @@ if __name__ == '__main__':
     parser.add_argument('--seg_head', action='store_true', help='Use segmentation head during test (requires seg_head.pth)')
     parser.add_argument('--top_percent', type=float, default=None, help='Top X%% of pixels marked as anomalous (e.g. 5). If not set, uses Otsu.')
     parser.add_argument('--lighting_aug', action='store_true', help='Apply random lighting augmentation during training')
+    parser.add_argument('--tiling', action='store_true', help='Use 2x2 overlapping tiling for train and test')
+    parser.add_argument('--tile_overlap', type=float, default=0.5, help='Tile overlap ratio (default 0.5)')
 
     args = parser.parse_args()
     args.save_name = args.save_name + f'_dataset={args.dataset}_Encoder={args.encoder}_Resize={args.input_size}_Crop={args.crop_size}_INP_num={args.INP_num}'
