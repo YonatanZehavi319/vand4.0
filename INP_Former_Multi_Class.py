@@ -101,7 +101,7 @@ def save_heatmaps(model, dataloader, device, save_dir, item, crop_size, seg_head
                 plt.close('all')
 
 
-def save_scores_csv(model, dataloader, device, save_dir, item, crop_size, max_ratio=0.01, metrics=None):
+def save_scores_csv(model, dataloader, device, save_dir, item, crop_size, max_ratio=0.01, metrics=None, top_percent=None):
     from utils import cal_anomaly_maps, get_gaussian_kernel
     import csv
     model.eval()
@@ -123,11 +123,39 @@ def save_scores_csv(model, dataloader, device, save_dir, item, crop_size, max_ra
                 score = sp_score[i].item()
                 all_scores.append(score)
                 all_labels.append(label[i].item())
+
+                # Per-image pixel-level metrics
+                amap = anomaly_map[i, 0].cpu().numpy()
+                amap_norm = (amap - amap.min()) / (amap.max() - amap.min() + 1e-8)
+                if top_percent is not None:
+                    threshold = np.percentile(amap_norm, 100 - top_percent)
+                    pred_binary = (amap_norm >= threshold).astype(int).flatten()
+                else:
+                    amap_uint8 = (amap_norm * 255).astype(np.uint8)
+                    _, pred_mask = cv2.threshold(amap_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    pred_binary = (pred_mask > 127).astype(int).flatten()
+
+                gt_map = gt[i, 0].numpy()
+                gt_binary = (gt_map > 0.5).astype(int).flatten()
+                tp = (pred_binary * gt_binary).sum()
+                fp = (pred_binary * (1 - gt_binary)).sum()
+                fn = ((1 - pred_binary) * gt_binary).sum()
+                px_precision = tp / (tp + fp + 1e-8)
+                px_recall = tp / (tp + fn + 1e-8)
+                seg_f1 = 2 * px_precision * px_recall / (px_precision + px_recall + 1e-8)
+                anomaly_area = gt_binary.sum() / len(gt_binary)
+                fp_area = fp / len(pred_binary)
+
                 rows.append({
                     'filename': os.path.basename(img_path[i]),
                     'defect_type': img_path[i].replace('\\', '/').split('/')[-2],
                     'anomaly_score': score,
                     'ground_truth': 'anomaly' if label[i] == 1 else 'normal',
+                    'seg_f1': f'{seg_f1:.4f}',
+                    'px_precision': f'{px_precision:.4f}',
+                    'px_recall': f'{px_recall:.4f}',
+                    'anomaly_area': f'{anomaly_area:.4f}',
+                    'fp_area': f'{fp_area:.4f}',
                 })
     # find threshold that maximizes F1
     from sklearn.metrics import precision_recall_curve
@@ -140,10 +168,10 @@ def save_scores_csv(model, dataloader, device, save_dir, item, crop_size, max_ra
     os.makedirs(out_dir, exist_ok=True)
     csv_path = os.path.join(out_dir, f'{item}_scores.csv')
     with open(csv_path, 'w', newline='') as f:
-        # Write metrics header
         if metrics:
             f.write(f"# Metrics: {', '.join(f'{k}={v:.4f}' for k, v in metrics.items())}\n")
-        writer = csv.DictWriter(f, fieldnames=['filename', 'defect_type', 'anomaly_score', 'ground_truth', 'predicted'])
+        writer = csv.DictWriter(f, fieldnames=['filename', 'defect_type', 'anomaly_score', 'ground_truth', 'predicted',
+                                                'seg_f1', 'px_precision', 'px_recall', 'anomaly_area', 'fp_area'])
         writer.writeheader()
         writer.writerows(rows)
 
@@ -344,7 +372,8 @@ def main(args):
                 scores_dir = os.path.join(args.save_dir, args.save_name, 'scores')
                 save_scores_csv(model, test_dataloader, device, os.path.join(args.save_dir, args.save_name), item, args.crop_size,
                                 metrics={'I-AUROC': auroc_sp, 'I-AP': ap_sp, 'I-F1': f1_sp,
-                                         'P-AUROC': auroc_px, 'P-AP': ap_px, 'P-F1': f1_px, 'P-AUPRO': aupro_px})
+                                         'P-AUROC': auroc_px, 'P-AP': ap_px, 'P-F1': f1_px, 'P-AUPRO': aupro_px},
+                                top_percent=args.top_percent)
                 print_fn(f'{item}: scores saved to {scores_dir}/{item}_scores.csv')
 
         print_fn(
