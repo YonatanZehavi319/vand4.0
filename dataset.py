@@ -156,11 +156,8 @@ class MVTecDataset(torch.utils.data.Dataset):
         return img, gt, label, img_path
 
 
-def extract_tiles(img, overlap=0.2, target_tile=1000, margin_ratio=0.1):
-    """Extract adaptive grid of overlapping tiles from a PIL Image.
-    Grid size adapts to aspect ratio. Mirror-pads edges by margin_ratio of tile size.
-    Returns: (list of PIL crops, tile_info dict)."""
-    w, h = img.size
+def compute_tile_info(w, h, overlap=0.2, target_tile=1000, margin_ratio=0.1):
+    """Compute tile grid info without touching pixel data. Lightweight for init."""
     cols = max(2, round(w / target_tile))
     rows = max(2, round(h / target_tile))
     if h < target_tile * 0.75:
@@ -171,33 +168,46 @@ def extract_tiles(img, overlap=0.2, target_tile=1000, margin_ratio=0.1):
     tile_w = int(w / (cols - overlap * (cols - 1))) if cols > 1 else w
     tile_h = int(h / (rows - overlap * (rows - 1))) if rows > 1 else h
 
-    # Mirror-pad the image so edge tiles have context
     margin_x = int(tile_w * margin_ratio)
     margin_y = int(tile_h * margin_ratio)
-    img_np = np.array(img)
-    padded = np.pad(img_np, ((margin_y, margin_y), (margin_x, margin_x), (0, 0)), mode='reflect')
-    padded_img = Image.fromarray(padded)
-    pw, ph = padded_img.size  # padded dimensions
 
     stride_x = int((w - tile_w) / max(1, cols - 1)) if cols > 1 else 0
     stride_y = int((h - tile_h) / max(1, rows - 1)) if rows > 1 else 0
 
-    tiles = []
-    positions = []  # positions in original (unpadded) coordinates
+    positions = []
     for r in range(rows):
         for c in range(cols):
             y = min(r * stride_y, h - tile_h)
             x = min(c * stride_x, w - tile_w)
-            # Crop from padded image (shift by margin)
-            px = x  # in padded coords, margin already offsets
-            py = y
-            tile = padded_img.crop((px, py, px + tile_w + 2 * margin_x, py + tile_h + 2 * margin_y))
-            tiles.append(tile)
             positions.append((y, x))
 
-    tile_info = {'h': h, 'w': w, 'tile_h': tile_h, 'tile_w': tile_w,
-                 'rows': rows, 'cols': cols, 'positions': positions,
-                 'n_tiles': len(tiles), 'margin_x': margin_x, 'margin_y': margin_y}
+    return {'h': h, 'w': w, 'tile_h': tile_h, 'tile_w': tile_w,
+            'rows': rows, 'cols': cols, 'positions': positions,
+            'n_tiles': rows * cols, 'margin_x': margin_x, 'margin_y': margin_y}
+
+
+def extract_tiles(img, overlap=0.2, target_tile=1000, margin_ratio=0.1):
+    """Extract adaptive grid of overlapping tiles from a PIL Image.
+    Grid size adapts to aspect ratio. Mirror-pads edges by margin_ratio of tile size.
+    Returns: (list of PIL crops, tile_info dict)."""
+    w, h = img.size
+    tile_info = compute_tile_info(w, h, overlap, target_tile, margin_ratio)
+    tile_h, tile_w = tile_info['tile_h'], tile_info['tile_w']
+    margin_x, margin_y = tile_info['margin_x'], tile_info['margin_y']
+
+    # Mirror-pad the image so edge tiles have context
+    img_np = np.array(img)
+    if img_np.ndim == 2:
+        padded = np.pad(img_np, ((margin_y, margin_y), (margin_x, margin_x)), mode='reflect')
+    else:
+        padded = np.pad(img_np, ((margin_y, margin_y), (margin_x, margin_x), (0, 0)), mode='reflect')
+    padded_img = Image.fromarray(padded)
+
+    tiles = []
+    for y, x in tile_info['positions']:
+        tile = padded_img.crop((x, y, x + tile_w + 2 * margin_x, y + tile_h + 2 * margin_y))
+        tiles.append(tile)
+
     return tiles, tile_info
 
 
@@ -217,10 +227,11 @@ class TiledImageFolder(torch.utils.data.Dataset):
             for ext in ('*.png', '*.JPG', '*.bmp'):
                 for img_path in sorted(glob.glob(os.path.join(class_path, ext))):
                     raw_paths.append(img_path)
-        # Build index by opening each image once to get tile count
+        # Build index by reading image size to get tile count (no pixel loading)
         for i, path in enumerate(raw_paths):
             img = Image.open(path)
-            _, info = extract_tiles(img, self.overlap)
+            w, h = img.size
+            info = compute_tile_info(w, h, self.overlap)
             self.samples.append(path)
             for t in range(info['n_tiles']):
                 self.tile_index.append((i, t))
@@ -244,11 +255,12 @@ class TiledMVTecDataset(torch.utils.data.Dataset):
         self.gt_transform = gt_transform
         self.overlap = overlap
         self.img_paths, self.gt_paths, self.labels, self.types = self._load()
-        # Pre-compute tile index
+        # Pre-compute tile index (no pixel loading, just image size)
         self.tile_index = []
         for i, path in enumerate(self.img_paths):
             img = Image.open(path)
-            _, info = extract_tiles(img, self.overlap)
+            w, h = img.size
+            info = compute_tile_info(w, h, self.overlap)
             for t in range(info['n_tiles']):
                 self.tile_index.append((i, t))
 
