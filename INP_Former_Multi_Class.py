@@ -374,7 +374,10 @@ def main(args):
                 for item, test_data in zip(args.item_list, test_data_list):
                     test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
                                                                   num_workers=4)
-                    results = evaluation_batch(model, test_dataloader, device, max_ratio=0.01, resize_mask=256)
+                    if use_tiling:
+                        results = evaluation_batch_tiled(model, test_dataloader, device, max_ratio=0.01, resize_mask=256)
+                    else:
+                        results = evaluation_batch(model, test_dataloader, device, max_ratio=0.01, resize_mask=256)
                     auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px = results
                     auroc_sp_list.append(auroc_sp)
                     ap_sp_list.append(ap_sp)
