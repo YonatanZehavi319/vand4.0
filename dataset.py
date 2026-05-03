@@ -16,15 +16,72 @@ import json
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 
-def get_data_transforms(size, isize, mean_train=None, std_train=None):
+class RandomLightingAugmentation:
+    """Randomly apply one lighting augmentation per image.
+    - Directional lighting (left/right/top/bottom)
+    - Over/underexposure
+    - Color tint and warmth
+    Applied with a given probability; otherwise image is unchanged."""
+
+    def __init__(self, p=0.5, intensity_range=(0.15, 0.4)):
+        self.p = p
+        self.intensity_range = intensity_range
+
+    def _apply_one(self, img_np, aug, intensity):
+        if aug in ('left', 'right', 'top', 'bottom'):
+            h, w = img_np.shape[:2]
+            if aug == 'left':
+                grad = np.linspace(1, 0, w)[None, :].repeat(h, axis=0)
+            elif aug == 'right':
+                grad = np.linspace(0, 1, w)[None, :].repeat(h, axis=0)
+            elif aug == 'top':
+                grad = np.linspace(1, 0, h)[:, None].repeat(w, axis=1)
+            else:
+                grad = np.linspace(0, 1, h)[:, None].repeat(w, axis=1)
+            ambient = 0.3
+            light_map = ambient + grad * (1.0 - ambient)
+            light_map = 1.0 - intensity * (1.0 - light_map)
+            img_np = img_np * light_map[:, :, None]
+        elif aug == 'overexpose':
+            img_np = img_np + intensity * (255.0 - img_np)
+        elif aug == 'underexpose':
+            img_np = img_np * (1.0 - intensity)
+        elif aug == 'tint':
+            tint = np.array([random.uniform(-1, 1), random.uniform(-1, 1), random.uniform(-1, 1)]) * intensity * 40
+            img_np = img_np + tint[None, None, :]
+        elif aug == 'warmth':
+            warm = intensity * 25
+            sign = random.choice([-1, 1])
+            img_np[:, :, 0] += sign * warm       # R
+            img_np[:, :, 2] -= sign * warm * 0.5  # B
+
+        return np.clip(img_np, 0, 255)
+
+    def __call__(self, img):
+        if random.random() > self.p:
+            return img
+        img_np = np.array(img).astype(np.float32)
+        all_augs = ['left', 'right', 'top', 'bottom', 'overexpose', 'underexpose', 'tint', 'warmth']
+        n_augs = random.choice([1, 2])
+        chosen = random.sample(all_augs, n_augs)
+        for aug in chosen:
+            intensity = random.uniform(*self.intensity_range)
+            img_np = self._apply_one(img_np, aug, intensity)
+        img_np = img_np.astype(np.uint8)
+        return Image.fromarray(img_np)
+
+
+def get_data_transforms(size, isize, mean_train=None, std_train=None, lighting_aug=False):
     mean_train = [0.485, 0.456, 0.406] if mean_train is None else mean_train
     std_train = [0.229, 0.224, 0.225] if std_train is None else std_train
-    data_transforms = transforms.Compose([
-        transforms.Resize((size, size)),
+    train_transforms_list = [transforms.Resize((size, size))]
+    if lighting_aug:
+        train_transforms_list.append(RandomLightingAugmentation(p=0.5))
+    train_transforms_list.extend([
         transforms.ToTensor(),
         transforms.CenterCrop(isize),
-        transforms.Normalize(mean=mean_train,
-                             std=std_train)])
+        transforms.Normalize(mean=mean_train, std=std_train)])
+    data_transforms = transforms.Compose(train_transforms_list)
     gt_transforms = transforms.Compose([
         transforms.Resize((size, size)),
         transforms.CenterCrop(isize),

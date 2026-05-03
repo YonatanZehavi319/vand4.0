@@ -181,7 +181,8 @@ def main(args):
     setup_seed(1)
 
     # Data Preparation
-    data_transform, gt_transform = get_data_transforms(args.input_size, args.crop_size)
+    lighting_aug = getattr(args, 'lighting_aug', False) and args.phase == 'train'
+    data_transform, gt_transform = get_data_transforms(args.input_size, args.crop_size, lighting_aug=lighting_aug)
 
     if args.dataset == 'MVTec-AD' or args.dataset == 'VisA':
         train_data_list = []
@@ -408,6 +409,7 @@ if __name__ == '__main__':
     parser.add_argument('--save_scores', action='store_true', help='Save per-image anomaly scores as CSV')
     parser.add_argument('--seg_head', action='store_true', help='Use segmentation head during test (requires seg_head.pth)')
     parser.add_argument('--top_percent', type=float, default=None, help='Top X%% of pixels marked as anomalous (e.g. 5). If not set, uses Otsu.')
+    parser.add_argument('--lighting_aug', action='store_true', help='Apply random lighting augmentation during training')
 
     args = parser.parse_args()
     args.save_name = args.save_name + f'_dataset={args.dataset}_Encoder={args.encoder}_Resize={args.input_size}_Crop={args.crop_size}_INP_num={args.INP_num}'
