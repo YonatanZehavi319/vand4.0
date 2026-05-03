@@ -97,10 +97,14 @@ def generate_anomaly(img_np, dtd_images, transparency_range=(0.5, 1.0)):
 
 class AnomalyTrainDataset(torch.utils.data.Dataset):
     """Dataset that loads normal images and generates pseudo-anomalies on-the-fly."""
-    def __init__(self, data_path, item_list, dtd_path, data_transform, gt_transform, input_size):
+    def __init__(self, data_path, item_list, dtd_path, data_transform, gt_transform, input_size, lighting_aug=False):
         self.data_transform = data_transform
         self.gt_transform = gt_transform
         self.input_size = input_size
+        self.lighting_aug = None
+        if lighting_aug:
+            from dataset import RandomLightingAugmentation
+            self.lighting_aug = RandomLightingAugmentation(p=0.5)
 
         # Collect all normal training images
         self.image_paths = []
@@ -133,6 +137,8 @@ class AnomalyTrainDataset(torch.utils.data.Dataset):
 
         # Convert to PIL for transforms
         anomalous_pil = Image.fromarray(anomalous_np)
+        if self.lighting_aug is not None:
+            anomalous_pil = self.lighting_aug(anomalous_pil)
         mask_pil = Image.fromarray((mask_np * 255).astype(np.uint8))
 
         # Apply transforms
@@ -220,6 +226,7 @@ def main(args):
         data_transform=data_transform,
         gt_transform=gt_transform,
         input_size=args.input_size,
+        lighting_aug=args.lighting_aug,
     )
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True
@@ -284,6 +291,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--seg_epochs', type=int, default=50)
     parser.add_argument('--seg_lr', type=float, default=1e-3)
+    parser.add_argument('--lighting_aug', action='store_true', help='Apply random lighting augmentation')
 
     args = parser.parse_args()
 
