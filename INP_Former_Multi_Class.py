@@ -437,8 +437,7 @@ def main(args):
         # Fit EVT null distribution from training data if requested
         evt_params = None
         if args.evt:
-            from torch.utils.data import ConcatDataset, DataLoader
-            train_dl = DataLoader(ConcatDataset(train_data_list), batch_size=args.batch_size, shuffle=False, num_workers=4)
+            train_dl = torch.utils.data.DataLoader(ConcatDataset(train_data_list), batch_size=args.batch_size, shuffle=False, num_workers=4)
             evt_params = fit_evt_null(model, train_dl, device)
             print_fn(f'EVT null fitted: shape={evt_params[0]:.4f}, loc={evt_params[1]:.6f}, scale={evt_params[2]:.6f}')
 
