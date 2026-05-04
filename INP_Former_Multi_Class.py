@@ -437,8 +437,14 @@ def main(args):
         # Fit EVT null distribution from training data if requested
         evt_params = None
         if args.evt:
-            train_dl = torch.utils.data.DataLoader(ConcatDataset(train_data_list), batch_size=args.batch_size, shuffle=False, num_workers=4)
-            evt_params = fit_evt_null(model, train_dl, device)
+            # Use non-tiled training data for EVT fitting (faster)
+            evt_train_list = []
+            for item in args.item_list:
+                train_path = os.path.join(args.data_path, item, 'train')
+                evt_data = ImageFolder(root=train_path, transform=data_transform)
+                evt_train_list.append(evt_data)
+            evt_dl = torch.utils.data.DataLoader(ConcatDataset(evt_train_list), batch_size=args.batch_size, shuffle=False, num_workers=4)
+            evt_params = fit_evt_null(model, evt_dl, device)
             print_fn(f'EVT null fitted: shape={evt_params[0]:.4f}, loc={evt_params[1]:.6f}, scale={evt_params[2]:.6f}')
 
         auroc_sp_list, ap_sp_list, f1_sp_list = [], [], []

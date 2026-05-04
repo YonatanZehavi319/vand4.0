@@ -255,23 +255,13 @@ def fit_evt_null(model, train_dataloader, device):
 
 def evt_threshold(anomaly_map_np, evt_params, fdr=0.01):
     """Apply EVT-based thresholding to an anomaly map.
+    Pixels with p-value < fdr are flagged as anomalous.
     Returns binary mask (uint8, 0 or 255)."""
     from scipy.stats import genextreme
     shape, loc, scale = evt_params
     p_values = 1 - genextreme.cdf(anomaly_map_np, shape, loc=loc, scale=scale)
-    # Benjamini-Hochberg on p-values
-    p_flat = p_values.flatten()
-    m = len(p_flat)
-    sorted_idx = np.argsort(p_flat)
-    sorted_p = p_flat[sorted_idx]
-    bh_threshold = np.arange(1, m + 1) / m * fdr
-    rejected = sorted_p <= bh_threshold
-    if rejected.any():
-        max_rejected = np.where(rejected)[0][-1]
-        rejected[:max_rejected + 1] = True
-    mask = np.zeros(m, dtype=np.uint8)
-    mask[sorted_idx[rejected]] = 255
-    return mask.reshape(anomaly_map_np.shape)
+    mask = ((p_values < fdr) * 255).astype(np.uint8)
+    return mask
 
 
 def evaluation_batch(model, dataloader, device, _class_=None, max_ratio=0, resize_mask=None):
