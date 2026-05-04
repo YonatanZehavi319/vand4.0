@@ -245,11 +245,14 @@ def fit_evt_null(model, train_dataloader, device):
             anomaly_map = gaussian_kernel(anomaly_map)
             all_pixel_scores.append(anomaly_map.flatten().cpu().numpy())
     all_pixel_scores = np.concatenate(all_pixel_scores)
-    # Fit GEV to the tail (top 5% of normal scores)
+    # Fit GEV to the tail (top 5% of normal scores), sample max 50k points for speed
     tail_threshold = np.percentile(all_pixel_scores, 95)
     tail_scores = all_pixel_scores[all_pixel_scores >= tail_threshold]
+    if len(tail_scores) > 50000:
+        tail_scores = np.random.choice(tail_scores, 50000, replace=False)
+    print(f'  Fitting GEV on {len(tail_scores)} tail samples...')
     shape, loc, scale = genextreme.fit(tail_scores)
-    print(f'  EVT fit: shape={shape:.4f}, loc={loc:.6f}, scale={scale:.6f}, n_tail={len(tail_scores)}')
+    print(f'  EVT fit: shape={shape:.4f}, loc={loc:.6f}, scale={scale:.6f}')
     return shape, loc, scale
 
 
