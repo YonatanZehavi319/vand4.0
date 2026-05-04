@@ -164,9 +164,15 @@ def save_heatmaps_tiled(model, dataloader, device, save_dir, item, crop_size, to
         plt.imsave(os.path.join(out_dir, f'{fname}_binary.png'), pred_mask_save, cmap='gray')
 
         if data['label'] == 1:
-            gt_map = stitch_tiles(data['gts'], data['h'], data['w'], data['tile_h'], data['tile_w'], data['positions'], mx, my)
-            gt_save = cv2.resize(gt_map, (save_size, save_size), interpolation=cv2.INTER_NEAREST)
-            plt.imsave(os.path.join(out_dir, f'{fname}_gt.png'), gt_save, cmap='gray')
+            # Load original GT directly — no tiling/stitching needed
+            gt_defect = path.replace('\\', '/').split('/')[-2]
+            gt_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(path))), 'ground_truth', gt_defect)
+            gt_name = os.path.splitext(os.path.basename(path))[0] + '_mask.png'
+            gt_path_full = os.path.join(gt_dir, gt_name)
+            if os.path.exists(gt_path_full):
+                gt_orig = cv2.imread(gt_path_full, cv2.IMREAD_GRAYSCALE)
+                gt_save = cv2.resize(gt_orig, (save_size, save_size), interpolation=cv2.INTER_NEAREST)
+                plt.imsave(os.path.join(out_dir, f'{fname}_gt.png'), gt_save, cmap='gray')
         plt.close('all')
 
 
