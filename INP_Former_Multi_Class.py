@@ -31,7 +31,7 @@ import cv2
 warnings.filterwarnings("ignore")
 
 
-def save_heatmaps(model, dataloader, device, save_dir, item, crop_size, seg_head=None, top_percent=None):
+def save_heatmaps(model, dataloader, device, save_dir, item, crop_size, seg_head=None, top_percent=None, min_score=None):
     from utils import cal_anomaly_maps, get_gaussian_kernel, denormalize, min_max_norm
     from models.uad import compute_residual
     model.eval()
@@ -67,7 +67,10 @@ def save_heatmaps(model, dataloader, device, save_dir, item, crop_size, seg_head
                 plt.imsave(os.path.join(out_dir, f'{fname}_overlay.png'), overlay)
 
                 # Binary mask
-                if top_percent is not None:
+                raw_max = anomaly_map[i, 0].cpu().numpy().max()
+                if min_score is not None and raw_max < min_score:
+                    pred_mask = np.zeros_like(amap, dtype=np.uint8)
+                elif top_percent is not None:
                     threshold = np.percentile(amap, 100 - top_percent)
                     pred_mask = ((amap >= threshold) * 255).astype(np.uint8)
                 else:
@@ -101,7 +104,7 @@ def save_heatmaps(model, dataloader, device, save_dir, item, crop_size, seg_head
                 plt.close('all')
 
 
-def save_heatmaps_tiled(model, dataloader, device, save_dir, item, crop_size, top_percent=None):
+def save_heatmaps_tiled(model, dataloader, device, save_dir, item, crop_size, top_percent=None, min_score=None):
     """Save stitched heatmaps from tiled test images."""
     from utils import cal_anomaly_maps, get_gaussian_kernel
     import ast
@@ -154,7 +157,9 @@ def save_heatmaps_tiled(model, dataloader, device, save_dir, item, crop_size, to
 
         # Binary mask (compute on full-res, then resize)
         amap_norm = (amap - amap.min()) / (amap.max() - amap.min() + 1e-8)
-        if top_percent is not None:
+        if min_score is not None and amap.max() < min_score:
+            pred_mask = np.zeros_like(amap_norm, dtype=np.uint8)
+        elif top_percent is not None:
             threshold = np.percentile(amap_norm, 100 - top_percent)
             pred_mask = ((amap_norm >= threshold) * 255).astype(np.uint8)
         else:
@@ -453,9 +458,9 @@ def main(args):
                 test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
                                                               num_workers=4)
                 if use_tiling:
-                    save_heatmaps_tiled(model, test_dataloader, device, map_dir, item, args.crop_size, top_percent=args.top_percent)
+                    save_heatmaps_tiled(model, test_dataloader, device, map_dir, item, args.crop_size, top_percent=args.top_percent, min_score=args.min_score)
                 else:
-                    save_heatmaps(model, test_dataloader, device, map_dir, item, args.crop_size, seg_head=seg_head_model, top_percent=args.top_percent)
+                    save_heatmaps(model, test_dataloader, device, map_dir, item, args.crop_size, seg_head=seg_head_model, top_percent=args.top_percent, min_score=args.min_score)
                 print_fn(f'{item}: heatmaps saved to {map_dir}/{item}/')
             if args.save_scores:
                 test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
@@ -499,6 +504,7 @@ if __name__ == '__main__':
     parser.add_argument('--save_scores', action='store_true', help='Save per-image anomaly scores as CSV')
     parser.add_argument('--seg_head', action='store_true', help='Use segmentation head during test (requires seg_head.pth)')
     parser.add_argument('--top_percent', type=float, default=None, help='Top X%% of pixels marked as anomalous (e.g. 5). If not set, uses Otsu.')
+    parser.add_argument('--min_score', type=float, default=None, help='Min raw anomaly score to trigger masking. Below this, output all black.')
     parser.add_argument('--lighting_aug', action='store_true', help='Apply random lighting augmentation during training')
     parser.add_argument('--tiling', action='store_true', help='Use 2x2 overlapping tiling for train and test')
     parser.add_argument('--tile_overlap', type=float, default=0.2, help='Tile overlap ratio (default 0.2)')
