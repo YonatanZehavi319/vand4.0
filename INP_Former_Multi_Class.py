@@ -11,7 +11,7 @@ from tqdm import tqdm
 from torch.nn.init import trunc_normal_
 import argparse
 from optimizers import StableAdamW
-from utils import evaluation_batch, evaluation_batch_with_seg, evaluation_batch_tiled, stitch_tiles, WarmCosineScheduler, global_cosine_hm_adaptive, setup_seed, get_logger
+from utils import evaluation_batch, evaluation_batch_with_seg, evaluation_batch_tiled, stitch_tiles, fit_evt_null, evt_threshold, WarmCosineScheduler, global_cosine_hm_adaptive, setup_seed, get_logger
 
 # Dataset-Related Modules
 from dataset import MVTecDataset, RealIADDataset, TiledImageFolder, TiledMVTecDataset
@@ -31,7 +31,7 @@ import cv2
 warnings.filterwarnings("ignore")
 
 
-def save_heatmaps(model, dataloader, device, save_dir, item, crop_size, seg_head=None, top_percent=None, min_score=None):
+def save_heatmaps(model, dataloader, device, save_dir, item, crop_size, seg_head=None, top_percent=None, min_score=None, evt_params=None, evt_fdr=0.01):
     from utils import cal_anomaly_maps, get_gaussian_kernel, denormalize, min_max_norm
     from models.uad import compute_residual
     model.eval()
@@ -67,8 +67,10 @@ def save_heatmaps(model, dataloader, device, save_dir, item, crop_size, seg_head
                 plt.imsave(os.path.join(out_dir, f'{fname}_overlay.png'), overlay)
 
                 # Binary mask
-                raw_max = anomaly_map[i, 0].cpu().numpy().max()
-                if min_score is not None and raw_max < min_score:
+                raw_amap = anomaly_map[i, 0].cpu().numpy()
+                if evt_params is not None:
+                    pred_mask = evt_threshold(raw_amap, evt_params, fdr=evt_fdr)
+                elif min_score is not None and raw_amap.max() < min_score:
                     pred_mask = np.zeros_like(amap, dtype=np.uint8)
                 elif top_percent is not None:
                     threshold = np.percentile(amap, 100 - top_percent)
@@ -104,7 +106,7 @@ def save_heatmaps(model, dataloader, device, save_dir, item, crop_size, seg_head
                 plt.close('all')
 
 
-def save_heatmaps_tiled(model, dataloader, device, save_dir, item, crop_size, top_percent=None, min_score=None):
+def save_heatmaps_tiled(model, dataloader, device, save_dir, item, crop_size, top_percent=None, min_score=None, evt_params=None, evt_fdr=0.01):
     """Save stitched heatmaps from tiled test images."""
     from utils import cal_anomaly_maps, get_gaussian_kernel
     import ast
@@ -157,7 +159,9 @@ def save_heatmaps_tiled(model, dataloader, device, save_dir, item, crop_size, to
 
         # Binary mask (compute on full-res, then resize)
         amap_norm = (amap - amap.min()) / (amap.max() - amap.min() + 1e-8)
-        if min_score is not None and amap.max() < min_score:
+        if evt_params is not None:
+            pred_mask = evt_threshold(amap, evt_params, fdr=evt_fdr)
+        elif min_score is not None and amap.max() < min_score:
             pred_mask = np.zeros_like(amap_norm, dtype=np.uint8)
         elif top_percent is not None:
             threshold = np.percentile(amap_norm, 100 - top_percent)
@@ -430,6 +434,14 @@ def main(args):
             seg_head_model.eval()
             print_fn(f'Loaded seg head from {seg_head_path}')
 
+        # Fit EVT null distribution from training data if requested
+        evt_params = None
+        if args.evt:
+            from torch.utils.data import ConcatDataset, DataLoader
+            train_dl = DataLoader(ConcatDataset(train_data_list), batch_size=args.batch_size, shuffle=False, num_workers=4)
+            evt_params = fit_evt_null(model, train_dl, device)
+            print_fn(f'EVT null fitted: shape={evt_params[0]:.4f}, loc={evt_params[1]:.6f}, scale={evt_params[2]:.6f}')
+
         auroc_sp_list, ap_sp_list, f1_sp_list = [], [], []
         auroc_px_list, ap_px_list, f1_px_list, aupro_px_list = [], [], [], []
         model.eval()
@@ -458,9 +470,9 @@ def main(args):
                 test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
                                                               num_workers=4)
                 if use_tiling:
-                    save_heatmaps_tiled(model, test_dataloader, device, map_dir, item, args.crop_size, top_percent=args.top_percent, min_score=args.min_score)
+                    save_heatmaps_tiled(model, test_dataloader, device, map_dir, item, args.crop_size, top_percent=args.top_percent, min_score=args.min_score, evt_params=evt_params, evt_fdr=args.evt_fdr)
                 else:
-                    save_heatmaps(model, test_dataloader, device, map_dir, item, args.crop_size, seg_head=seg_head_model, top_percent=args.top_percent, min_score=args.min_score)
+                    save_heatmaps(model, test_dataloader, device, map_dir, item, args.crop_size, seg_head=seg_head_model, top_percent=args.top_percent, min_score=args.min_score, evt_params=evt_params, evt_fdr=args.evt_fdr)
                 print_fn(f'{item}: heatmaps saved to {map_dir}/{item}/')
             if args.save_scores:
                 test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
@@ -505,6 +517,8 @@ if __name__ == '__main__':
     parser.add_argument('--seg_head', action='store_true', help='Use segmentation head during test (requires seg_head.pth)')
     parser.add_argument('--top_percent', type=float, default=None, help='Top X%% of pixels marked as anomalous (e.g. 5). If not set, uses Otsu.')
     parser.add_argument('--min_score', type=float, default=None, help='Min raw anomaly score to trigger masking. Below this, output all black.')
+    parser.add_argument('--evt', action='store_true', help='Use Extreme Value Theory for thresholding (fits GEV to training scores)')
+    parser.add_argument('--evt_fdr', type=float, default=0.01, help='FDR rate for EVT-based BH thresholding (default 0.01)')
     parser.add_argument('--lighting_aug', action='store_true', help='Apply random lighting augmentation during training')
     parser.add_argument('--tiling', action='store_true', help='Use 2x2 overlapping tiling for train and test')
     parser.add_argument('--tile_overlap', type=float, default=0.2, help='Tile overlap ratio (default 0.2)')

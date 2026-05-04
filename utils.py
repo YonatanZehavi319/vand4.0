@@ -229,6 +229,51 @@ def save_imag_ZS(imgs, anomaly_map, gt, prototype_map, save_root, img_path):
         plt.imsave(os.path.join(save_root, class_name, category, fr'{idx_name}_3.png'), distance, cmap='jet')
         plt.close()
 
+def fit_evt_null(model, train_dataloader, device):
+    """Fit a GEV distribution to per-pixel anomaly scores from training images.
+    Returns (shape, loc, scale) of the fitted GEV distribution."""
+    from scipy.stats import genextreme
+    model.eval()
+    gaussian_kernel = get_gaussian_kernel(kernel_size=5, sigma=4).to(device)
+    all_pixel_scores = []
+    with torch.no_grad():
+        for batch in tqdm(train_dataloader, desc='Fitting EVT null', ncols=80):
+            img = batch[0].to(device)
+            output = model(img)
+            en, de = output[0], output[1]
+            anomaly_map, _ = cal_anomaly_maps(en, de, img.shape[-1])
+            anomaly_map = gaussian_kernel(anomaly_map)
+            all_pixel_scores.append(anomaly_map.flatten().cpu().numpy())
+    all_pixel_scores = np.concatenate(all_pixel_scores)
+    # Fit GEV to the tail (top 5% of normal scores)
+    tail_threshold = np.percentile(all_pixel_scores, 95)
+    tail_scores = all_pixel_scores[all_pixel_scores >= tail_threshold]
+    shape, loc, scale = genextreme.fit(tail_scores)
+    print(f'  EVT fit: shape={shape:.4f}, loc={loc:.6f}, scale={scale:.6f}, n_tail={len(tail_scores)}')
+    return shape, loc, scale
+
+
+def evt_threshold(anomaly_map_np, evt_params, fdr=0.01):
+    """Apply EVT-based thresholding to an anomaly map.
+    Returns binary mask (uint8, 0 or 255)."""
+    from scipy.stats import genextreme
+    shape, loc, scale = evt_params
+    p_values = 1 - genextreme.cdf(anomaly_map_np, shape, loc=loc, scale=scale)
+    # Benjamini-Hochberg on p-values
+    p_flat = p_values.flatten()
+    m = len(p_flat)
+    sorted_idx = np.argsort(p_flat)
+    sorted_p = p_flat[sorted_idx]
+    bh_threshold = np.arange(1, m + 1) / m * fdr
+    rejected = sorted_p <= bh_threshold
+    if rejected.any():
+        max_rejected = np.where(rejected)[0][-1]
+        rejected[:max_rejected + 1] = True
+    mask = np.zeros(m, dtype=np.uint8)
+    mask[sorted_idx[rejected]] = 255
+    return mask.reshape(anomaly_map_np.shape)
+
+
 def evaluation_batch(model, dataloader, device, _class_=None, max_ratio=0, resize_mask=None):
     model.eval()
     gt_list_px = []
