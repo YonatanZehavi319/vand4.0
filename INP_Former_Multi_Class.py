@@ -143,23 +143,30 @@ def save_heatmaps_tiled(model, dataloader, device, save_dir, item, crop_size, to
 
         mx, my = data['margin_x'], data['margin_y']
         amap = stitch_tiles(data['maps'], data['h'], data['w'], data['tile_h'], data['tile_w'], data['positions'], mx, my)
-        amap = (amap - amap.min()) / (amap.max() - amap.min() + 1e-8)
+
+        # Resize to save size before saving (keep full-res for metrics)
+        save_size = 512
+        amap_save = cv2.resize(amap, (save_size, save_size))
+        amap_save = (amap_save - amap_save.min()) / (amap_save.max() - amap_save.min() + 1e-8)
 
         # Save heatmap
-        plt.imsave(os.path.join(out_dir, f'{fname}_heatmap.png'), amap, cmap='jet')
+        plt.imsave(os.path.join(out_dir, f'{fname}_heatmap.png'), amap_save, cmap='jet')
 
-        # Binary mask
+        # Binary mask (compute on full-res, then resize)
+        amap_norm = (amap - amap.min()) / (amap.max() - amap.min() + 1e-8)
         if top_percent is not None:
-            threshold = np.percentile(amap, 100 - top_percent)
-            pred_mask = ((amap >= threshold) * 255).astype(np.uint8)
+            threshold = np.percentile(amap_norm, 100 - top_percent)
+            pred_mask = ((amap_norm >= threshold) * 255).astype(np.uint8)
         else:
-            amap_uint8 = (amap * 255).astype(np.uint8)
+            amap_uint8 = (amap_norm * 255).astype(np.uint8)
             _, pred_mask = cv2.threshold(amap_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        plt.imsave(os.path.join(out_dir, f'{fname}_binary.png'), pred_mask, cmap='gray')
+        pred_mask_save = cv2.resize(pred_mask, (save_size, save_size), interpolation=cv2.INTER_NEAREST)
+        plt.imsave(os.path.join(out_dir, f'{fname}_binary.png'), pred_mask_save, cmap='gray')
 
         if data['label'] == 1:
             gt_map = stitch_tiles(data['gts'], data['h'], data['w'], data['tile_h'], data['tile_w'], data['positions'], mx, my)
-            plt.imsave(os.path.join(out_dir, f'{fname}_gt.png'), gt_map, cmap='gray')
+            gt_save = cv2.resize(gt_map, (save_size, save_size), interpolation=cv2.INTER_NEAREST)
+            plt.imsave(os.path.join(out_dir, f'{fname}_gt.png'), gt_save, cmap='gray')
         plt.close('all')
 
 
