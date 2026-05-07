@@ -92,16 +92,19 @@ def main(args):
             for inp_path in inp_heatmaps:
                 fname = os.path.basename(inp_path).replace('_heatmap.png', '')
 
-                # Load INP-Former heatmap
-                inp_map = load_heatmap(inp_path)
+                # Load INP-Former heatmap (.npy preferred, PNG fallback)
+                inp_npy = os.path.join(inp_sub, f'{fname}_heatmap_raw.npy')
+                inp_map = load_heatmap_npy(inp_npy)
+                if inp_map is None:
+                    inp_map = load_heatmap(inp_path)
                 if inp_map is None:
                     continue
 
-                # Try to load CPR heatmap (matching filename)
-                cpr_path = os.path.join(cpr_sub, f'{fname}_heatmap.png')
+                # Load CPR heatmap (.npy preferred, PNG fallback)
                 cpr_npy = os.path.join(cpr_sub, f'{fname}_heatmap_raw.npy')
                 cpr_map = load_heatmap_npy(cpr_npy)
                 if cpr_map is None:
+                    cpr_path = os.path.join(cpr_sub, f'{fname}_heatmap.png')
                     cpr_map = load_heatmap(cpr_path)
 
                 # Resize both to common size
