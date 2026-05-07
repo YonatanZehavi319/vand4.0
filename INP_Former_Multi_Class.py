@@ -260,61 +260,12 @@ def save_scores_csv(model, dataloader, device, save_dir, item, crop_size, max_ra
         writer.writerows(rows)
 
 
-def main(args):
-    # Fixing the Random Seed
-    setup_seed(1)
-
-    # Data Preparation
-    lighting_aug = getattr(args, 'lighting_aug', False) and args.phase == 'train'
-    data_transform, gt_transform = get_data_transforms(args.input_size, args.crop_size, lighting_aug=lighting_aug)
-
-    use_tiling = getattr(args, 'tiling', False)
-    tile_overlap = getattr(args, 'tile_overlap', 0.5)
-
-    if args.dataset == 'MVTec-AD' or args.dataset == 'VisA':
-        train_data_list = []
-        test_data_list = []
-        for i, item in enumerate(args.item_list):
-            train_path = os.path.join(args.data_path, item, 'train')
-            test_path = os.path.join(args.data_path, item)
-
-            if use_tiling:
-                train_data = TiledImageFolder(root=train_path, transform=data_transform, overlap=tile_overlap)
-                test_data = TiledMVTecDataset(root=test_path, transform=data_transform, gt_transform=gt_transform, phase="test", overlap=tile_overlap)
-            else:
-                train_data = ImageFolder(root=train_path, transform=data_transform)
-                train_data.classes = item
-                train_data.class_to_idx = {item: i}
-                train_data.samples = [(sample[0], i) for sample in train_data.samples]
-                test_data = MVTecDataset(root=test_path, transform=data_transform, gt_transform=gt_transform, phase="test")
-            train_data_list.append(train_data)
-            test_data_list.append(test_data)
-        train_data = ConcatDataset(train_data_list)
-        train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
-    elif args.dataset == 'Real-IAD' :
-        train_data_list = []
-        test_data_list = []
-        for i, item in enumerate(args.item_list):
-            train_data = RealIADDataset(root=args.data_path, category=item, transform=data_transform,
-                                        gt_transform=gt_transform,
-                                        phase='train')
-            train_data.classes = item
-            train_data.class_to_idx = {item: i}
-            test_data = RealIADDataset(root=args.data_path, category=item, transform=data_transform,
-                                       gt_transform=gt_transform,
-                                       phase="test")
-            train_data_list.append(train_data)
-            test_data_list.append(test_data)
-
-        train_data = ConcatDataset(train_data_list)
-        train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=4,
-                                                       drop_last=True)
-    # Adopting a grouping-based reconstruction strategy similar to Dinomaly
+def build_model(args, device):
+    """Build a fresh INP-Former model."""
     target_layers = [2, 3, 4, 5, 6, 7, 8, 9]
     fuse_layer_encoder = [[0, 1, 2, 3], [4, 5, 6, 7]]
     fuse_layer_decoder = [[0, 1, 2, 3], [4, 5, 6, 7]]
 
-    # Encoder info
     encoder = vit_encoder.load(args.encoder)
     if 'small' in args.encoder:
         embed_dim, num_heads = 384, 6
@@ -324,175 +275,198 @@ def main(args):
         embed_dim, num_heads = 1024, 16
         target_layers = [4, 6, 8, 10, 12, 14, 16, 18]
     else:
-        raise "Architecture not in small, base, large."
+        raise ValueError("Architecture not in small, base, large.")
 
-    # Model Preparation
-    Bottleneck = []
-    INP_Guided_Decoder = []
-    INP_Extractor = []
+    Bottleneck = nn.ModuleList([Mlp(embed_dim, embed_dim * 4, embed_dim, drop=0.)])
+    INP = nn.ParameterList([nn.Parameter(torch.randn(args.INP_num, embed_dim)) for _ in range(1)])
+    INP_Extractor = nn.ModuleList([
+        Aggregation_Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=4.,
+                          qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-8))
+    ])
+    INP_Guided_Decoder = nn.ModuleList([
+        Prototype_Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=4.,
+                        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-8))
+        for _ in range(8)
+    ])
 
-    # bottleneck
-    Bottleneck.append(Mlp(embed_dim, embed_dim * 4, embed_dim, drop=0.))
-    Bottleneck = nn.ModuleList(Bottleneck)
+    model = INP_Former(encoder=encoder, bottleneck=Bottleneck, aggregation=INP_Extractor,
+                       decoder=INP_Guided_Decoder, target_layers=target_layers,
+                       remove_class_token=True, fuse_layer_encoder=fuse_layer_encoder,
+                       fuse_layer_decoder=fuse_layer_decoder, prototype_token=INP)
+    return model.to(device), embed_dim, Bottleneck, INP_Guided_Decoder, INP_Extractor, INP
 
-    # INP
-    INP = nn.ParameterList(
-                    [nn.Parameter(torch.randn(args.INP_num, embed_dim))
-                     for _ in range(1)])
 
-    # INP Extractor
-    for i in range(1):
-        blk = Aggregation_Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=4.,
-                                qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-8))
-        INP_Extractor.append(blk)
-    INP_Extractor = nn.ModuleList(INP_Extractor)
+def train_one_category(args, item, data_transform, gt_transform, device, use_tiling, tile_overlap):
+    """Train a model for a single category."""
+    model, embed_dim, Bottleneck, INP_Guided_Decoder, INP_Extractor, INP = build_model(args, device)
 
-    # INP_Guided_Decoder
-    for i in range(8):
-        blk = Prototype_Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=4.,
-                              qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-8))
-        INP_Guided_Decoder.append(blk)
-    INP_Guided_Decoder = nn.ModuleList(INP_Guided_Decoder)
+    train_path = os.path.join(args.data_path, item, 'train')
+    test_path = os.path.join(args.data_path, item)
 
-    model = INP_Former(encoder=encoder, bottleneck=Bottleneck, aggregation=INP_Extractor, decoder=INP_Guided_Decoder,
-                             target_layers=target_layers,  remove_class_token=True, fuse_layer_encoder=fuse_layer_encoder,
-                             fuse_layer_decoder=fuse_layer_decoder, prototype_token=INP)
-    model = model.to(device)
+    if use_tiling:
+        train_data = TiledImageFolder(root=train_path, transform=data_transform, overlap=tile_overlap)
+        test_data = TiledMVTecDataset(root=test_path, transform=data_transform, gt_transform=gt_transform, phase="test", overlap=tile_overlap)
+    else:
+        train_data = ImageFolder(root=train_path, transform=data_transform)
+        train_data.samples = [(s[0], 0) for s in train_data.samples]
+        test_data = MVTecDataset(root=test_path, transform=data_transform, gt_transform=gt_transform, phase="test")
 
-    if args.phase == 'train':
-        # Model Initialization
-        trainable = nn.ModuleList([Bottleneck, INP_Guided_Decoder, INP_Extractor, INP])
-        for m in trainable.modules():
-            if isinstance(m, nn.Linear):
-                trunc_normal_(m.weight, std=0.01, a=-0.03, b=0.03)
-                if isinstance(m, nn.Linear) and m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.LayerNorm):
+    train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
+
+    # Initialize
+    trainable = nn.ModuleList([Bottleneck, INP_Guided_Decoder, INP_Extractor, INP])
+    for m in trainable.modules():
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=0.01, a=-0.03, b=0.03)
+            if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-                nn.init.constant_(m.weight, 1.0)
-        # define optimizer
-        optimizer = StableAdamW([{'params': trainable.parameters()}],
-                                lr=1e-3, betas=(0.9, 0.999), weight_decay=1e-4, amsgrad=True, eps=1e-10)
-        lr_scheduler = WarmCosineScheduler(optimizer, base_value=1e-3, final_value=1e-4, total_iters=args.total_epochs*len(train_dataloader),
-                                           warmup_iters=100)
-        print_fn('train image number:{}'.format(len(train_data)))
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
 
-        # Train
-        for epoch in range(args.total_epochs):
-            model.train()
-            loss_list = []
-            for img, _ in tqdm(train_dataloader, ncols=80):
-                img = img.to(device)
-                en, de, g_loss = model(img)
-                loss = global_cosine_hm_adaptive(en, de, y=3)
-                loss = loss + 0.2 * g_loss
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm(trainable.parameters(), max_norm=0.1)
-                optimizer.step()
-                loss_list.append(loss.item())
-                lr_scheduler.step()
-            print_fn('epoch [{}/{}], loss:{:.4f}'.format(epoch+1, args.total_epochs, np.mean(loss_list)))
-            if (epoch + 1) % args.total_epochs == 0:
-                auroc_sp_list, ap_sp_list, f1_sp_list = [], [], []
-                auroc_px_list, ap_px_list, f1_px_list, aupro_px_list = [], [], [], []
+    optimizer = StableAdamW([{'params': trainable.parameters()}],
+                            lr=1e-3, betas=(0.9, 0.999), weight_decay=1e-4, amsgrad=True, eps=1e-10)
+    lr_scheduler = WarmCosineScheduler(optimizer, base_value=1e-3, final_value=1e-4,
+                                       total_iters=args.total_epochs * len(train_dataloader), warmup_iters=100)
 
-                for item, test_data in zip(args.item_list, test_data_list):
-                    test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
-                                                                  num_workers=4)
-                    if use_tiling:
-                        results = evaluation_batch_tiled(model, test_dataloader, device, max_ratio=0.01, resize_mask=256)
-                    else:
-                        results = evaluation_batch(model, test_dataloader, device, max_ratio=0.01, resize_mask=256)
-                    auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px = results
-                    auroc_sp_list.append(auroc_sp)
-                    ap_sp_list.append(ap_sp)
-                    f1_sp_list.append(f1_sp)
-                    auroc_px_list.append(auroc_px)
-                    ap_px_list.append(ap_px)
-                    f1_px_list.append(f1_px)
-                    aupro_px_list.append(aupro_px)
-                    print_fn(
-                        '{}: I-Auroc:{:.4f}, I-AP:{:.4f}, I-F1:{:.4f}, P-AUROC:{:.4f}, P-AP:{:.4f}, P-F1:{:.4f}, P-AUPRO:{:.4f}'.format(
-                            item, auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px))
+    print_fn(f'=== Training {item} === ({len(train_data)} samples)')
+    for epoch in range(args.total_epochs):
+        model.train()
+        loss_list = []
+        for img, _ in tqdm(train_dataloader, ncols=80, desc=f'{item} [{epoch+1}/{args.total_epochs}]'):
+            img = img.to(device)
+            en, de, g_loss = model(img)
+            loss = global_cosine_hm_adaptive(en, de, y=3)
+            loss = loss + 0.2 * g_loss
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm(trainable.parameters(), max_norm=0.1)
+            optimizer.step()
+            loss_list.append(loss.item())
+            lr_scheduler.step()
+        print_fn(f'{item}: epoch [{epoch+1}/{args.total_epochs}], loss:{np.mean(loss_list):.4f}')
 
-                print_fn('Mean: I-Auroc:{:.4f}, I-AP:{:.4f}, I-F1:{:.4f}, P-AUROC:{:.4f}, P-AP:{:.4f}, P-F1:{:.4f}, P-AUPRO:{:.4f}'.format(
-                        np.mean(auroc_sp_list), np.mean(ap_sp_list), np.mean(f1_sp_list),
-                        np.mean(auroc_px_list), np.mean(ap_px_list), np.mean(f1_px_list), np.mean(aupro_px_list)))
-                torch.save(model.state_dict(), os.path.join(args.save_dir, args.save_name, 'model.pth'))
-                model.train()
-    elif args.phase == 'test':
-        # Test
-        model.load_state_dict(torch.load(os.path.join(args.save_dir, args.save_name, 'model.pth')), strict=True)
+    # Save model per category
+    cat_save_dir = os.path.join(args.save_dir, args.save_name, item)
+    os.makedirs(cat_save_dir, exist_ok=True)
+    torch.save(model.state_dict(), os.path.join(cat_save_dir, 'model.pth'))
+    print_fn(f'{item}: model saved to {cat_save_dir}/model.pth')
 
-        # Load seg head if requested
-        seg_head_model = None
-        if args.seg_head:
-            seg_head_path = os.path.join(args.save_dir, args.save_name, 'seg_head.pth')
+    # Evaluate
+    test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    if use_tiling:
+        results = evaluation_batch_tiled(model, test_dataloader, device, max_ratio=0.01, resize_mask=256)
+    else:
+        results = evaluation_batch(model, test_dataloader, device, max_ratio=0.01, resize_mask=256)
+    auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px = results
+    print_fn('{}: I-Auroc:{:.4f}, I-AP:{:.4f}, I-F1:{:.4f}, P-AUROC:{:.4f}, P-AP:{:.4f}, P-F1:{:.4f}, P-AUPRO:{:.4f}'.format(
+        item, auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px))
+    return results
+
+
+def test_one_category(args, item, data_transform, gt_transform, device, use_tiling, tile_overlap, embed_dim):
+    """Test a model for a single category."""
+    model, embed_dim, *_ = build_model(args, device)
+
+    cat_save_dir = os.path.join(args.save_dir, args.save_name, item)
+    model.load_state_dict(torch.load(os.path.join(cat_save_dir, 'model.pth')), strict=True)
+    model.eval()
+
+    test_path = os.path.join(args.data_path, item)
+    if use_tiling:
+        test_data = TiledMVTecDataset(root=test_path, transform=data_transform, gt_transform=gt_transform, phase="test", overlap=tile_overlap)
+    else:
+        test_data = MVTecDataset(root=test_path, transform=data_transform, gt_transform=gt_transform, phase="test")
+
+    # Seg head
+    seg_head_model = None
+    if args.seg_head:
+        seg_head_path = os.path.join(cat_save_dir, 'seg_head.pth')
+        if os.path.exists(seg_head_path):
             seg_head_model = SegHead(in_channels=embed_dim).to(device)
             seg_head_model.load_state_dict(torch.load(seg_head_path, map_location=device))
             seg_head_model.eval()
-            print_fn(f'Loaded seg head from {seg_head_path}')
+            print_fn(f'{item}: loaded seg head')
 
-        # Fit EVT null distribution from training data if requested
-        evt_params = None
-        if args.evt:
-            # Use non-tiled training data for EVT fitting (faster)
-            evt_train_list = []
-            for item in args.item_list:
-                train_path = os.path.join(args.data_path, item, 'train')
-                evt_data = ImageFolder(root=train_path, transform=data_transform)
-                evt_train_list.append(evt_data)
-            evt_dl = torch.utils.data.DataLoader(ConcatDataset(evt_train_list), batch_size=args.batch_size, shuffle=False, num_workers=4)
-            evt_params = fit_evt_null(model, evt_dl, device)
-            print_fn(f'EVT null fitted: shape={evt_params[0]:.4f}, loc={evt_params[1]:.6f}, scale={evt_params[2]:.6f}')
+    # EVT
+    evt_params = None
+    if args.evt:
+        train_path = os.path.join(args.data_path, item, 'train')
+        evt_data = ImageFolder(root=train_path, transform=data_transform)
+        evt_dl = torch.utils.data.DataLoader(evt_data, batch_size=args.batch_size, shuffle=False, num_workers=4)
+        evt_params = fit_evt_null(model, evt_dl, device)
+        print_fn(f'{item}: EVT fitted (shape={evt_params[0]:.4f}, loc={evt_params[1]:.6f}, scale={evt_params[2]:.6f})')
 
-        auroc_sp_list, ap_sp_list, f1_sp_list = [], [], []
-        auroc_px_list, ap_px_list, f1_px_list, aupro_px_list = [], [], [], []
-        model.eval()
+    # Evaluate
+    test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    if use_tiling:
+        results = evaluation_batch_tiled(model, test_dataloader, device, max_ratio=0.01, resize_mask=256)
+    elif seg_head_model is not None:
+        results = evaluation_batch_with_seg(model, seg_head_model, test_dataloader, device, max_ratio=0.01, resize_mask=256)
+    else:
+        results = evaluation_batch(model, test_dataloader, device, max_ratio=0.01, resize_mask=256)
+    auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px = results
+    print_fn('{}: I-Auroc:{:.4f}, I-AP:{:.4f}, I-F1:{:.4f}, P-AUROC:{:.4f}, P-AP:{:.4f}, P-F1:{:.4f}, P-AUPRO:{:.4f}'.format(
+        item, auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px))
+
+    # Save maps
+    if args.save_maps:
         map_dir = os.path.join(args.save_dir, args.save_name, 'heatmaps')
-        for item, test_data in zip(args.item_list, test_data_list):
-            test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
-                                                          num_workers=4)
-            if use_tiling:
-                results = evaluation_batch_tiled(model, test_dataloader, device, max_ratio=0.01, resize_mask=256)
-            elif seg_head_model is not None:
-                results = evaluation_batch_with_seg(model, seg_head_model, test_dataloader, device, max_ratio=0.01, resize_mask=256)
-            else:
-                results = evaluation_batch(model, test_dataloader, device, max_ratio=0.01, resize_mask=256)
-            auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px = results
-            auroc_sp_list.append(auroc_sp)
-            ap_sp_list.append(ap_sp)
-            f1_sp_list.append(f1_sp)
-            auroc_px_list.append(auroc_px)
-            ap_px_list.append(ap_px)
-            f1_px_list.append(f1_px)
-            aupro_px_list.append(aupro_px)
-            print_fn(
-                '{}: I-Auroc:{:.4f}, I-AP:{:.4f}, I-F1:{:.4f}, P-AUROC:{:.4f}, P-AP:{:.4f}, P-F1:{:.4f}, P-AUPRO:{:.4f}'.format(
-                    item, auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px))
-            if args.save_maps:
-                test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
-                                                              num_workers=4)
-                if use_tiling:
-                    save_heatmaps_tiled(model, test_dataloader, device, map_dir, item, args.crop_size, top_percent=args.top_percent, min_score=args.min_score, evt_params=evt_params, evt_fdr=args.evt_fdr)
-                else:
-                    save_heatmaps(model, test_dataloader, device, map_dir, item, args.crop_size, seg_head=seg_head_model, top_percent=args.top_percent, min_score=args.min_score, evt_params=evt_params, evt_fdr=args.evt_fdr)
-                print_fn(f'{item}: heatmaps saved to {map_dir}/{item}/')
-            if args.save_scores:
-                test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
-                                                              num_workers=4)
-                scores_dir = os.path.join(args.save_dir, args.save_name, 'scores')
-                save_scores_csv(model, test_dataloader, device, os.path.join(args.save_dir, args.save_name), item, args.crop_size,
-                                metrics={'I-AUROC': auroc_sp, 'I-AP': ap_sp, 'I-F1': f1_sp,
-                                         'P-AUROC': auroc_px, 'P-AP': ap_px, 'P-F1': f1_px, 'P-AUPRO': aupro_px},
-                                top_percent=args.top_percent)
-                print_fn(f'{item}: scores saved to {scores_dir}/{item}_scores.csv')
+        test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=4)
+        if use_tiling:
+            save_heatmaps_tiled(model, test_dataloader, device, map_dir, item, args.crop_size, top_percent=args.top_percent, min_score=args.min_score, evt_params=evt_params, evt_fdr=args.evt_fdr)
+        else:
+            save_heatmaps(model, test_dataloader, device, map_dir, item, args.crop_size, seg_head=seg_head_model, top_percent=args.top_percent, min_score=args.min_score, evt_params=evt_params, evt_fdr=args.evt_fdr)
+        print_fn(f'{item}: heatmaps saved')
 
-        print_fn(
-            'Mean: I-Auroc:{:.4f}, I-AP:{:.4f}, I-F1:{:.4f}, P-AUROC:{:.4f}, P-AP:{:.4f}, P-F1:{:.4f}, P-AUPRO:{:.4f}'.format(
-                np.mean(auroc_sp_list), np.mean(ap_sp_list), np.mean(f1_sp_list),
-                np.mean(auroc_px_list), np.mean(ap_px_list), np.mean(f1_px_list), np.mean(aupro_px_list)))
+    # Save scores
+    if args.save_scores:
+        test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=4)
+        save_scores_csv(model, test_dataloader, device, os.path.join(args.save_dir, args.save_name), item, args.crop_size,
+                        metrics={'I-AUROC': auroc_sp, 'I-AP': ap_sp, 'I-F1': f1_sp,
+                                 'P-AUROC': auroc_px, 'P-AP': ap_px, 'P-F1': f1_px, 'P-AUPRO': aupro_px},
+                        top_percent=args.top_percent)
+        print_fn(f'{item}: scores saved')
+
+    return results
+
+
+def main(args):
+    setup_seed(1)
+
+    lighting_aug = getattr(args, 'lighting_aug', False) and args.phase == 'train'
+    data_transform, gt_transform = get_data_transforms(args.input_size, args.crop_size, lighting_aug=lighting_aug)
+
+    use_tiling = getattr(args, 'tiling', False)
+    tile_overlap = getattr(args, 'tile_overlap', 0.2)
+
+    # Determine which categories to process
+    if args.item:
+        items_to_process = [args.item]
+    else:
+        items_to_process = args.item_list
+
+    # Encoder info for embed_dim
+    if 'small' in args.encoder:
+        embed_dim = 384
+    elif 'base' in args.encoder:
+        embed_dim = 768
+    elif 'large' in args.encoder:
+        embed_dim = 1024
+
+    all_results = []
+    for item in items_to_process:
+        print_fn(f'\n{"="*20} {item} {"="*20}')
+        if args.phase == 'train':
+            results = train_one_category(args, item, data_transform, gt_transform, device, use_tiling, tile_overlap)
+        elif args.phase == 'test':
+            results = test_one_category(args, item, data_transform, gt_transform, device, use_tiling, tile_overlap, embed_dim)
+        all_results.append(results)
+
+    # Print mean across all categories
+    if len(all_results) > 1:
+        mean_results = np.mean(all_results, axis=0)
+        print_fn('\nMean: I-Auroc:{:.4f}, I-AP:{:.4f}, I-F1:{:.4f}, P-AUROC:{:.4f}, P-AP:{:.4f}, P-F1:{:.4f}, P-AUPRO:{:.4f}'.format(*mean_results))
 
 
 if __name__ == '__main__':
@@ -527,6 +501,7 @@ if __name__ == '__main__':
     parser.add_argument('--lighting_aug', action='store_true', help='Apply random lighting augmentation during training')
     parser.add_argument('--tiling', action='store_true', help='Use 2x2 overlapping tiling for train and test')
     parser.add_argument('--tile_overlap', type=float, default=0.2, help='Tile overlap ratio (default 0.2)')
+    parser.add_argument('--item', type=str, default=None, help='Train/test a single category (e.g. can). If not set, runs all categories.')
 
     args = parser.parse_args()
     args.save_name = args.save_name + f'_dataset={args.dataset}_Encoder={args.encoder}_Resize={args.input_size}_Crop={args.crop_size}_INP_num={args.INP_num}'
