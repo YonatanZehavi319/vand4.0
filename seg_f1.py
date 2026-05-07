@@ -4,10 +4,14 @@ import os
 import sys
 from glob import glob
 
-def compute_seg_f1(binary_path, gt_path, resize):
+def compute_seg_f1(binary_path, gt_path, resize=None):
     binary = cv.imread(binary_path, cv.IMREAD_GRAYSCALE)
     gt = cv.imread(gt_path, cv.IMREAD_GRAYSCALE)
+    # Auto-detect size from binary if resize not specified
+    if resize is None:
+        resize = binary.shape[0]
     gt = cv.resize(gt, (resize, resize))
+    binary = cv.resize(binary, (resize, resize))
     pred = (binary > 127).astype(int).flatten()
     gt = (gt > 127).astype(int).flatten()
     tp = (pred * gt).sum()
@@ -28,7 +32,7 @@ def main():
 
     results_dir = sys.argv[1]
     data_dir = sys.argv[2]
-    resize = 320
+    resize = None
     use_bh = '--bh' in sys.argv
     use_seg = '--seg' in sys.argv
     per_image = '--per-image' in sys.argv
@@ -83,7 +87,9 @@ def main():
                 cat_results.append((anomaly_type, image_name, p, r, f1))
 
                 binary = cv.imread(binary_path, cv.IMREAD_GRAYSCALE)
-                gt = cv.resize(cv.imread(gt_path, cv.IMREAD_GRAYSCALE), (resize, resize))
+                match_size = binary.shape[0] if resize is None else resize
+                binary = cv.resize(binary, (match_size, match_size))
+                gt = cv.resize(cv.imread(gt_path, cv.IMREAD_GRAYSCALE), (match_size, match_size))
                 pred = (binary > 127).astype(int).flatten()
                 gt_flat = (gt > 127).astype(int).flatten()
                 cat_tp += (pred * gt_flat).sum()
