@@ -58,8 +58,9 @@ def save_heatmaps(model, dataloader, device, save_dir, item, crop_size, seg_head
                 out_dir = os.path.join(save_dir, item, defect_type)
                 os.makedirs(out_dir, exist_ok=True)
                 input_img = denormalize(img[i].cpu().numpy())
-                amap = anomaly_map[i, 0].cpu().numpy()
-                amap = (amap - amap.min()) / (amap.max() - amap.min() + 1e-8)
+                raw_amap = anomaly_map[i, 0].cpu().numpy()
+                np.save(os.path.join(out_dir, f'{fname}_heatmap_raw.npy'), raw_amap)
+                amap = (raw_amap - raw_amap.min()) / (raw_amap.max() - raw_amap.min() + 1e-8)
                 plt.imsave(os.path.join(out_dir, f'{fname}_input.png'), input_img)
                 plt.imsave(os.path.join(out_dir, f'{fname}_heatmap.png'), amap, cmap='jet')
                 amap_color = (plt.cm.jet(amap)[:, :, :3] * 255).astype(np.uint8)
@@ -156,6 +157,7 @@ def save_heatmaps_tiled(model, dataloader, device, save_dir, item, crop_size, to
 
         # Save heatmap
         plt.imsave(os.path.join(out_dir, f'{fname}_heatmap.png'), amap_save, cmap='jet')
+        np.save(os.path.join(out_dir, f'{fname}_heatmap_raw.npy'), amap)
 
         # Binary mask (compute on full-res, then resize)
         amap_norm = (amap - amap.min()) / (amap.max() - amap.min() + 1e-8)

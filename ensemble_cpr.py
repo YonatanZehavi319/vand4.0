@@ -35,14 +35,23 @@ def normalize_map(amap):
     return (amap - amap.min()) / (amap.max() - amap.min() + 1e-8)
 
 
+def _build_jet_reverse_lut():
+    """Build a lookup table to reverse jet colormap: RGB -> scalar value."""
+    jet_lut = (plt.cm.jet(np.linspace(0, 1, 256))[:, :3] * 255).astype(np.uint8)
+    # Create reverse LUT: for each possible RGB, find the closest jet index
+    # Use a quantized approach for speed
+    reverse = {}
+    for i in range(256):
+        r, g, b = jet_lut[i]
+        reverse[(r, g, b)] = i
+    return jet_lut, reverse
+
 def load_heatmap(path):
-    """Load a saved heatmap PNG and convert back to grayscale float."""
-    img = cv2.imread(path)
+    """Load a saved heatmap PNG as grayscale (fallback when .npy not available)."""
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if img is None:
         return None
-    # Heatmaps saved with jet colormap — convert to grayscale by taking the raw values
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
-    return gray
+    return img.astype(np.float32) / 255.0
 
 
 def load_heatmap_npy(path):
