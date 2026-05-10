@@ -62,9 +62,11 @@ def load_heatmap_npy(path):
     return None
 
 
-def combine_heatmaps(inp_dir, cpr_dir, fname, save_size, inp_weight, cpr_weight, raw=False):
+def combine_heatmaps(inp_dir, cpr_dir, fname, save_size, inp_weight, cpr_weight, global_stats=None):
     """Load and combine INP-Former + CPR heatmaps for a single image.
-    If raw=True, skip per-image normalization (for EVT fitting/thresholding).
+    global_stats: if provided, dict with 'inp_min','inp_max','cpr_min','cpr_max' for
+                  global normalization (preserves cross-image differences).
+                  If None, uses per-image normalization.
     Returns the combined (weighted average) heatmap, or None if INP heatmap not found."""
     # Load INP-Former heatmap (.npy preferred, PNG fallback)
     inp_npy = os.path.join(inp_dir, f'{fname}_heatmap_raw.npy')
@@ -76,7 +78,10 @@ def combine_heatmaps(inp_dir, cpr_dir, fname, save_size, inp_weight, cpr_weight,
         return None, False
 
     inp_resized = cv2.resize(inp_map, (save_size, save_size))
-    inp_val = inp_resized if raw else normalize_map(inp_resized)
+    if global_stats is not None:
+        inp_val = (inp_resized - global_stats['inp_min']) / (global_stats['inp_max'] - global_stats['inp_min'] + 1e-8)
+    else:
+        inp_val = normalize_map(inp_resized)
 
     # Load CPR heatmap (.npy preferred, PNG fallback)
     cpr_npy = os.path.join(cpr_dir, f'{fname}_heatmap_raw.npy')
@@ -87,14 +92,42 @@ def combine_heatmaps(inp_dir, cpr_dir, fname, save_size, inp_weight, cpr_weight,
 
     if cpr_map is not None:
         cpr_resized = cv2.resize(cpr_map, (save_size, save_size))
-        cpr_val = cpr_resized if raw else normalize_map(cpr_resized)
+        if global_stats is not None:
+            cpr_val = (cpr_resized - global_stats['cpr_min']) / (global_stats['cpr_max'] - global_stats['cpr_min'] + 1e-8)
+        else:
+            cpr_val = normalize_map(cpr_resized)
         combined = (inp_weight * inp_val + cpr_weight * cpr_val) / (inp_weight + cpr_weight)
         return combined, True
     else:
         return inp_val, False
 
 
-def fit_evt_from_validation(inp_val_dir, cpr_val_dir, category, save_size, inp_weight, cpr_weight):
+def compute_global_stats(inp_val_dir, cpr_val_dir, categories, save_size):
+    """Compute global min/max per model across all validation heatmaps."""
+    inp_min, inp_max = float('inf'), float('-inf')
+    cpr_min, cpr_max = float('inf'), float('-inf')
+
+    for category in categories:
+        inp_good = os.path.join(inp_val_dir, category, 'good')
+        cpr_good = os.path.join(cpr_val_dir, category, 'good')
+
+        for npy_path in sorted(glob(os.path.join(inp_good, '*_heatmap_raw.npy'))):
+            amap = np.load(npy_path)
+            amap = cv2.resize(amap, (save_size, save_size))
+            inp_min = min(inp_min, amap.min())
+            inp_max = max(inp_max, amap.max())
+
+        for npy_path in sorted(glob(os.path.join(cpr_good, '*_heatmap_raw.npy'))):
+            amap = np.load(npy_path)
+            amap = cv2.resize(amap, (save_size, save_size))
+            cpr_min = min(cpr_min, amap.min())
+            cpr_max = max(cpr_max, amap.max())
+
+    print(f"  Global stats — INP: [{inp_min:.4f}, {inp_max:.4f}], CPR: [{cpr_min:.4f}, {cpr_max:.4f}]")
+    return {'inp_min': inp_min, 'inp_max': inp_max, 'cpr_min': cpr_min, 'cpr_max': cpr_max}
+
+
+def fit_evt_from_validation(inp_val_dir, cpr_val_dir, category, save_size, inp_weight, cpr_weight, global_stats=None):
     """Fit GEV distribution on combined validation/good heatmaps for a category.
     Returns (shape, loc, scale) EVT params."""
     inp_val_good = os.path.join(inp_val_dir, category, 'good')
@@ -110,7 +143,7 @@ def fit_evt_from_validation(inp_val_dir, cpr_val_dir, category, save_size, inp_w
     all_pixel_scores = []
     for npy_path in inp_npy_files:
         fname = os.path.basename(npy_path).replace('_heatmap_raw.npy', '')
-        combined, _ = combine_heatmaps(inp_val_good, cpr_val_good, fname, save_size, inp_weight, cpr_weight, raw=True)
+        combined, _ = combine_heatmaps(inp_val_good, cpr_val_good, fname, save_size, inp_weight, cpr_weight, global_stats=global_stats)
         if combined is not None:
             all_pixel_scores.append(combined.flatten())
 
@@ -144,17 +177,20 @@ def main(args):
 
     save_size = args.save_size
 
-    # Fit EVT params per category from validation heatmaps
+    # Compute global normalization stats and fit EVT from validation heatmaps
+    global_stats = None
     evt_params_per_cat = {}
     if args.evt:
         if not args.inp_val_dir or not args.cpr_val_dir:
             print("ERROR: --evt requires --inp_val_dir and --cpr_val_dir")
             sys.exit(1)
+        print("Computing global normalization stats from validation...")
+        global_stats = compute_global_stats(args.inp_val_dir, args.cpr_val_dir, categories, save_size)
         print("Fitting EVT from validation heatmaps...")
         for category in categories:
             params = fit_evt_from_validation(
                 args.inp_val_dir, args.cpr_val_dir, category,
-                save_size, args.inp_weight, args.cpr_weight)
+                save_size, args.inp_weight, args.cpr_weight, global_stats=global_stats)
             if params is not None:
                 evt_params_per_cat[category] = params
 
@@ -183,9 +219,9 @@ def main(args):
             for inp_path in inp_heatmaps:
                 fname = os.path.basename(inp_path).replace('_heatmap.png', '')
 
-                use_raw = cat_evt is not None
                 combined, was_combined = combine_heatmaps(
-                    inp_sub, cpr_sub, fname, save_size, args.inp_weight, args.cpr_weight, raw=use_raw)
+                    inp_sub, cpr_sub, fname, save_size, args.inp_weight, args.cpr_weight,
+                    global_stats=global_stats if cat_evt else None)
                 if combined is None:
                     continue
                 if was_combined:
