@@ -155,8 +155,8 @@ def fit_evt_from_validation(inp_val_dir, cpr_val_dir, category, save_size, inp_w
     # Fit GEV to the tail (top 5% of normal scores), sample max 50k for speed
     tail_threshold = np.percentile(all_pixel_scores, 95)
     tail_scores = all_pixel_scores[all_pixel_scores >= tail_threshold]
-    if len(tail_scores) > 50000:
-        tail_scores = np.random.choice(tail_scores, 50000, replace=False)
+    if len(tail_scores) > 500000:
+        tail_scores = np.random.choice(tail_scores, 500000, replace=False)
     print(f'  {category}: fitting GEV on {len(tail_scores)} tail samples...')
     shape, loc, scale = genextreme.fit(tail_scores)
     print(f'  {category}: EVT fit: shape={shape:.4f}, loc={loc:.6f}, scale={scale:.6f}')
