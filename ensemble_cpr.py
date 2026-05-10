@@ -227,7 +227,34 @@ def main(args):
                 if was_combined:
                     n_combined += 1
 
-                # Save combined heatmap
+                # Apply smoothing
+                if args.bilateral or args.guided:
+                    # Load original image as guide
+                    orig_path = None
+                    for ext in ['.png', '.JPG', '.bmp']:
+                        p = os.path.join(args.data_dir, category, 'test', sub_dir, fname + ext)
+                        if os.path.exists(p):
+                            orig_path = p
+                            break
+                    guide = None
+                    if orig_path is not None:
+                        guide = cv2.imread(orig_path)
+                        guide = cv2.resize(guide, (save_size, save_size))
+
+                    if args.bilateral:
+                        combined_f32 = combined.astype(np.float32)
+                        combined = cv2.bilateralFilter(combined_f32, d=args.bilateral_d,
+                                                        sigmaColor=args.bilateral_sc,
+                                                        sigmaSpace=args.bilateral_ss)
+
+                    if args.guided and guide is not None:
+                        combined_f32 = combined.astype(np.float32)
+                        guide_gray = cv2.cvtColor(guide, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+                        combined = cv2.ximgproc.guidedFilter(guide_gray, combined_f32,
+                                                             radius=args.guided_r,
+                                                             eps=args.guided_eps)
+
+                # Save combined heatmap (after smoothing)
                 plt.imsave(os.path.join(out_sub, f'{fname}_heatmap.png'), combined, cmap='jet')
 
                 # Binary mask
@@ -271,6 +298,14 @@ if __name__ == '__main__':
     parser.add_argument('--evt_fdr', type=float, default=0.01, help='FDR rate for EVT thresholding (default 0.01)')
     parser.add_argument('--inp_val_dir', type=str, default=None, help='Path to INP-Former validation heatmaps dir')
     parser.add_argument('--cpr_val_dir', type=str, default=None, help='Path to CPR validation heatmaps dir')
+    # Smoothing options
+    parser.add_argument('--bilateral', action='store_true', help='Apply bilateral filter to combined heatmap')
+    parser.add_argument('--bilateral_d', type=int, default=9, help='Bilateral filter diameter (default 9)')
+    parser.add_argument('--bilateral_sc', type=float, default=75, help='Bilateral filter sigmaColor (default 75)')
+    parser.add_argument('--bilateral_ss', type=float, default=75, help='Bilateral filter sigmaSpace (default 75)')
+    parser.add_argument('--guided', action='store_true', help='Apply guided filter using original image')
+    parser.add_argument('--guided_r', type=int, default=8, help='Guided filter radius (default 8)')
+    parser.add_argument('--guided_eps', type=float, default=0.01, help='Guided filter eps (default 0.01)')
 
     args = parser.parse_args()
     main(args)
