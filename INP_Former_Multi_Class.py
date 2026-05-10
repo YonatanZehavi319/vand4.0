@@ -479,7 +479,7 @@ def main(args):
 
     lighting_aug = getattr(args, 'lighting_aug', False) and args.phase == 'train'
     lighting_intensity = (args.lighting_min, args.lighting_max)
-    data_transform, gt_transform = get_data_transforms(args.input_size, args.crop_size, lighting_aug=lighting_aug, lighting_intensity=lighting_intensity)
+    data_transform, gt_transform = get_data_transforms(args.input_size, args.crop_size, lighting_aug=lighting_aug, lighting_intensity=lighting_intensity, lighting_prob=args.lighting_prob)
 
     use_tiling = getattr(args, 'tiling', False)
     tile_overlap = getattr(args, 'tile_overlap', 0.2)
@@ -548,6 +548,7 @@ if __name__ == '__main__':
     parser.add_argument('--lighting_aug', action='store_true', help='Apply random lighting augmentation during training')
     parser.add_argument('--lighting_min', type=float, default=0.08, help='Min lighting augmentation intensity (default 0.08)')
     parser.add_argument('--lighting_max', type=float, default=0.2, help='Max lighting augmentation intensity (default 0.2)')
+    parser.add_argument('--lighting_prob', type=float, default=0.5, help='Probability of applying lighting augmentation (default 0.5)')
     parser.add_argument('--tiling', action='store_true', help='Use 2x2 overlapping tiling for train and test')
     parser.add_argument('--tile_overlap', type=float, default=0.2, help='Tile overlap ratio (default 0.2)')
     parser.add_argument('--item', type=str, default=None, help='Train/test a single category (e.g. can). If not set, runs all categories.')
