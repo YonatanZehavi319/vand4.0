@@ -197,15 +197,16 @@ def main(args):
 
         # Compute per-category FDR scaled by GEV scale parameter
         if args.adaptive_fdr and evt_params_per_cat:
+            alpha = args.adaptive_strength
             scales = [p[2] for p in evt_params_per_cat.values()]
             median_scale = np.median(scales)
-            print(f"\nAdaptive FDR (base={args.evt_fdr}, median_scale={median_scale:.6f}):")
+            print(f"\nAdaptive FDR (base={args.evt_fdr}, strength={alpha}, median_scale={median_scale:.6f}):")
             for cat, params in evt_params_per_cat.items():
                 cat_scale = params[2]
-                # Smaller scale → higher FDR (more permissive)
-                # Larger scale → lower FDR (more strict)
-                cat_fdr = args.evt_fdr * (median_scale / cat_scale)
-                # Clamp to reasonable range
+                # Pure adaptive: scale inversely with GEV scale
+                raw_fdr = args.evt_fdr * (median_scale / cat_scale)
+                # Blend with base: alpha=0 → uniform, alpha=1 → full adaptive
+                cat_fdr = alpha * raw_fdr + (1 - alpha) * args.evt_fdr
                 cat_fdr = np.clip(cat_fdr, 0.01, 0.5)
                 evt_fdr_per_cat[cat] = cat_fdr
                 print(f"  {cat}: scale={cat_scale:.6f}, fdr={cat_fdr:.4f}")
@@ -317,6 +318,7 @@ if __name__ == '__main__':
     parser.add_argument('--evt', action='store_true', help='Use EVT thresholding (fit on validation heatmaps)')
     parser.add_argument('--evt_fdr', type=float, default=0.01, help='FDR rate for EVT thresholding (default 0.01)')
     parser.add_argument('--adaptive_fdr', action='store_true', help='Scale FDR per category based on GEV scale parameter')
+    parser.add_argument('--adaptive_strength', type=float, default=0.3, help='Blend strength: 0=uniform, 1=full adaptive (default 0.3)')
     parser.add_argument('--inp_val_dir', type=str, default=None, help='Path to INP-Former validation heatmaps dir')
     parser.add_argument('--cpr_val_dir', type=str, default=None, help='Path to CPR validation heatmaps dir')
     # Smoothing options
