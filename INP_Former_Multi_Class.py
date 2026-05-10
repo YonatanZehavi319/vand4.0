@@ -479,10 +479,9 @@ def main(args):
 
     lighting_aug = getattr(args, 'lighting_aug', False) and args.phase == 'train'
     lighting_intensity = (args.lighting_min, args.lighting_max)
-    data_transform, gt_transform = get_data_transforms(args.input_size, args.crop_size, lighting_aug=lighting_aug, lighting_intensity=lighting_intensity, lighting_prob=args.lighting_prob)
-
     use_tiling = getattr(args, 'tiling', False)
     tile_overlap = getattr(args, 'tile_overlap', 0.2)
+    data_transform, gt_transform = get_data_transforms(args.input_size, args.crop_size, lighting_aug=lighting_aug, lighting_intensity=lighting_intensity, lighting_prob=args.lighting_prob, tiling=use_tiling)
 
     # Determine which categories to process
     if args.item:
