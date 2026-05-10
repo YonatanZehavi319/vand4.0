@@ -62,8 +62,9 @@ def load_heatmap_npy(path):
     return None
 
 
-def combine_heatmaps(inp_dir, cpr_dir, fname, save_size, inp_weight, cpr_weight):
+def combine_heatmaps(inp_dir, cpr_dir, fname, save_size, inp_weight, cpr_weight, raw=False):
     """Load and combine INP-Former + CPR heatmaps for a single image.
+    If raw=True, skip per-image normalization (for EVT fitting/thresholding).
     Returns the combined (weighted average) heatmap, or None if INP heatmap not found."""
     # Load INP-Former heatmap (.npy preferred, PNG fallback)
     inp_npy = os.path.join(inp_dir, f'{fname}_heatmap_raw.npy')
@@ -75,7 +76,7 @@ def combine_heatmaps(inp_dir, cpr_dir, fname, save_size, inp_weight, cpr_weight)
         return None, False
 
     inp_resized = cv2.resize(inp_map, (save_size, save_size))
-    inp_norm = normalize_map(inp_resized)
+    inp_val = inp_resized if raw else normalize_map(inp_resized)
 
     # Load CPR heatmap (.npy preferred, PNG fallback)
     cpr_npy = os.path.join(cpr_dir, f'{fname}_heatmap_raw.npy')
@@ -86,11 +87,11 @@ def combine_heatmaps(inp_dir, cpr_dir, fname, save_size, inp_weight, cpr_weight)
 
     if cpr_map is not None:
         cpr_resized = cv2.resize(cpr_map, (save_size, save_size))
-        cpr_norm = normalize_map(cpr_resized)
-        combined = (inp_weight * inp_norm + cpr_weight * cpr_norm) / (inp_weight + cpr_weight)
+        cpr_val = cpr_resized if raw else normalize_map(cpr_resized)
+        combined = (inp_weight * inp_val + cpr_weight * cpr_val) / (inp_weight + cpr_weight)
         return combined, True
     else:
-        return inp_norm, False
+        return inp_val, False
 
 
 def fit_evt_from_validation(inp_val_dir, cpr_val_dir, category, save_size, inp_weight, cpr_weight):
@@ -109,7 +110,7 @@ def fit_evt_from_validation(inp_val_dir, cpr_val_dir, category, save_size, inp_w
     all_pixel_scores = []
     for npy_path in inp_npy_files:
         fname = os.path.basename(npy_path).replace('_heatmap_raw.npy', '')
-        combined, _ = combine_heatmaps(inp_val_good, cpr_val_good, fname, save_size, inp_weight, cpr_weight)
+        combined, _ = combine_heatmaps(inp_val_good, cpr_val_good, fname, save_size, inp_weight, cpr_weight, raw=True)
         if combined is not None:
             all_pixel_scores.append(combined.flatten())
 
@@ -182,8 +183,9 @@ def main(args):
             for inp_path in inp_heatmaps:
                 fname = os.path.basename(inp_path).replace('_heatmap.png', '')
 
+                use_raw = cat_evt is not None
                 combined, was_combined = combine_heatmaps(
-                    inp_sub, cpr_sub, fname, save_size, args.inp_weight, args.cpr_weight)
+                    inp_sub, cpr_sub, fname, save_size, args.inp_weight, args.cpr_weight, raw=use_raw)
                 if combined is None:
                     continue
                 if was_combined:
