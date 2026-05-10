@@ -180,6 +180,7 @@ def main(args):
     # Compute global normalization stats and fit EVT from validation heatmaps
     global_stats = None
     evt_params_per_cat = {}
+    evt_fdr_per_cat = {}
     if args.evt:
         if not args.inp_val_dir or not args.cpr_val_dir:
             print("ERROR: --evt requires --inp_val_dir and --cpr_val_dir")
@@ -193,6 +194,24 @@ def main(args):
                 save_size, args.inp_weight, args.cpr_weight, global_stats=global_stats)
             if params is not None:
                 evt_params_per_cat[category] = params
+
+        # Compute per-category FDR scaled by GEV scale parameter
+        if args.adaptive_fdr and evt_params_per_cat:
+            scales = [p[2] for p in evt_params_per_cat.values()]
+            median_scale = np.median(scales)
+            print(f"\nAdaptive FDR (base={args.evt_fdr}, median_scale={median_scale:.6f}):")
+            for cat, params in evt_params_per_cat.items():
+                cat_scale = params[2]
+                # Smaller scale → higher FDR (more permissive)
+                # Larger scale → lower FDR (more strict)
+                cat_fdr = args.evt_fdr * (median_scale / cat_scale)
+                # Clamp to reasonable range
+                cat_fdr = np.clip(cat_fdr, 0.01, 0.5)
+                evt_fdr_per_cat[cat] = cat_fdr
+                print(f"  {cat}: scale={cat_scale:.6f}, fdr={cat_fdr:.4f}")
+        else:
+            for cat in evt_params_per_cat:
+                evt_fdr_per_cat[cat] = args.evt_fdr
 
     for category in categories:
         inp_cat_dir = os.path.join(args.inp_dir, category)
@@ -259,7 +278,8 @@ def main(args):
 
                 # Binary mask
                 if cat_evt is not None:
-                    pred_mask = evt_threshold(combined, cat_evt, fdr=args.evt_fdr)
+                    cat_fdr = evt_fdr_per_cat.get(category, args.evt_fdr)
+                    pred_mask = evt_threshold(combined, cat_evt, fdr=cat_fdr)
                 elif args.top_percent is not None:
                     threshold = np.percentile(combined, 100 - args.top_percent)
                     pred_mask = ((combined >= threshold) * 255).astype(np.uint8)
@@ -278,7 +298,7 @@ def main(args):
                 plt.close('all')
 
         print(f"  {category}: {n_combined} images combined (INP + CPR)" +
-              (f" [EVT fdr={args.evt_fdr}]" if cat_evt else ""))
+              (f" [EVT fdr={evt_fdr_per_cat.get(category, args.evt_fdr):.4f}]" if cat_evt else ""))
 
     print(f"\nEnsemble heatmaps saved to {args.out_dir}/")
 
@@ -296,6 +316,7 @@ if __name__ == '__main__':
     parser.add_argument('--top_percent', type=float, default=None, help='Top X%% threshold. If not set, uses Otsu.')
     parser.add_argument('--evt', action='store_true', help='Use EVT thresholding (fit on validation heatmaps)')
     parser.add_argument('--evt_fdr', type=float, default=0.01, help='FDR rate for EVT thresholding (default 0.01)')
+    parser.add_argument('--adaptive_fdr', action='store_true', help='Scale FDR per category based on GEV scale parameter')
     parser.add_argument('--inp_val_dir', type=str, default=None, help='Path to INP-Former validation heatmaps dir')
     parser.add_argument('--cpr_val_dir', type=str, default=None, help='Path to CPR validation heatmaps dir')
     # Smoothing options
