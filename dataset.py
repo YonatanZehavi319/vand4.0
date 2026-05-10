@@ -227,9 +227,10 @@ def extract_tiles(img, overlap=0.2, target_tile=1000, margin_ratio=0.1):
 
 class TiledImageFolder(torch.utils.data.Dataset):
     """Training dataset that yields individual tiles from each image."""
-    def __init__(self, root, transform, overlap=0.5):
+    def __init__(self, root, transform, overlap=0.5, target_tile=1000):
         self.transform = transform
         self.overlap = overlap
+        self.target_tile = target_tile
         # Pre-compute tile counts per image
         self.samples = []
         self.tile_index = []  # (img_idx, tile_idx)
@@ -245,7 +246,7 @@ class TiledImageFolder(torch.utils.data.Dataset):
         for i, path in enumerate(raw_paths):
             img = Image.open(path)
             w, h = img.size
-            info = compute_tile_info(w, h, self.overlap)
+            info = compute_tile_info(w, h, self.overlap, target_tile=self.target_tile)
             self.samples.append(path)
             for t in range(info['n_tiles']):
                 self.tile_index.append((i, t))
@@ -256,25 +257,26 @@ class TiledImageFolder(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         img_idx, tile_idx = self.tile_index[idx]
         img = Image.open(self.samples[img_idx]).convert('RGB')
-        tiles, _ = extract_tiles(img, self.overlap)
+        tiles, _ = extract_tiles(img, self.overlap, target_tile=self.target_tile)
         return self.transform(tiles[tile_idx]), 0
 
 
 class TiledMVTecDataset(torch.utils.data.Dataset):
     """Test dataset that yields tiles with GT tiles and metadata for stitching."""
-    def __init__(self, root, transform, gt_transform, phase, overlap=0.5):
+    def __init__(self, root, transform, gt_transform, phase, overlap=0.5, target_tile=1000):
         self.img_path_dir = os.path.join(root, 'test')
         self.gt_path_dir = os.path.join(root, 'ground_truth')
         self.transform = transform
         self.gt_transform = gt_transform
         self.overlap = overlap
+        self.target_tile = target_tile
         self.img_paths, self.gt_paths, self.labels, self.types = self._load()
         # Pre-compute tile index (no pixel loading, just image size)
         self.tile_index = []
         for i, path in enumerate(self.img_paths):
             img = Image.open(path)
             w, h = img.size
-            info = compute_tile_info(w, h, self.overlap)
+            info = compute_tile_info(w, h, self.overlap, target_tile=self.target_tile)
             for t in range(info['n_tiles']):
                 self.tile_index.append((i, t))
 
@@ -306,14 +308,14 @@ class TiledMVTecDataset(torch.utils.data.Dataset):
         label = self.labels[img_idx]
 
         img = Image.open(img_path).convert('RGB')
-        tiles, tile_info = extract_tiles(img, self.overlap)
+        tiles, tile_info = extract_tiles(img, self.overlap, target_tile=self.target_tile)
         tile_img = self.transform(tiles[tile_idx])
 
         if label == 0:
             tile_gt = torch.zeros([1, tile_img.size(-2), tile_img.size(-1)])
         else:
             gt = Image.open(self.gt_paths[img_idx]).convert('L')
-            gt_tiles, _ = extract_tiles(gt, self.overlap)
+            gt_tiles, _ = extract_tiles(gt, self.overlap, target_tile=self.target_tile)
             tile_gt = self.gt_transform(gt_tiles[tile_idx])
 
         # Pack tile_info as individual values for dataloader compatibility

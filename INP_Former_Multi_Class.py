@@ -306,8 +306,8 @@ def train_one_category(args, item, data_transform, gt_transform, device, use_til
     test_path = os.path.join(args.data_path, item)
 
     if use_tiling:
-        train_data = TiledImageFolder(root=train_path, transform=data_transform, overlap=tile_overlap)
-        test_data = TiledMVTecDataset(root=test_path, transform=data_transform, gt_transform=gt_transform, phase="test", overlap=tile_overlap)
+        train_data = TiledImageFolder(root=train_path, transform=data_transform, overlap=tile_overlap, target_tile=args.target_tile)
+        test_data = TiledMVTecDataset(root=test_path, transform=data_transform, gt_transform=gt_transform, phase="test", overlap=tile_overlap, target_tile=args.target_tile)
     else:
         train_data = ImageFolder(root=train_path, transform=data_transform)
         train_data.samples = [(s[0], 0) for s in train_data.samples]
@@ -376,7 +376,7 @@ def test_one_category(args, item, data_transform, gt_transform, device, use_tili
 
     test_path = os.path.join(args.data_path, item)
     if use_tiling:
-        test_data = TiledMVTecDataset(root=test_path, transform=data_transform, gt_transform=gt_transform, phase="test", overlap=tile_overlap)
+        test_data = TiledMVTecDataset(root=test_path, transform=data_transform, gt_transform=gt_transform, phase="test", overlap=tile_overlap, target_tile=args.target_tile)
     else:
         test_data = MVTecDataset(root=test_path, transform=data_transform, gt_transform=gt_transform, phase="test")
 
@@ -550,6 +550,7 @@ if __name__ == '__main__':
     parser.add_argument('--lighting_prob', type=float, default=0.5, help='Probability of applying lighting augmentation (default 0.5)')
     parser.add_argument('--tiling', action='store_true', help='Use 2x2 overlapping tiling for train and test')
     parser.add_argument('--tile_overlap', type=float, default=0.2, help='Tile overlap ratio (default 0.2)')
+    parser.add_argument('--target_tile', type=int, default=1000, help='Target tile size in pixels (default 1000). Lower = more tiles = more detail.')
     parser.add_argument('--item', type=str, default=None, help='Train/test a single category (e.g. can). If not set, runs all categories.')
 
     args = parser.parse_args()
