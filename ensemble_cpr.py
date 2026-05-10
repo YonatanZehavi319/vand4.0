@@ -78,7 +78,9 @@ def combine_heatmaps(inp_dir, cpr_dir, fname, save_size, inp_weight, cpr_weight,
         return None, False
 
     inp_resized = cv2.resize(inp_map, (save_size, save_size))
-    if global_stats is not None:
+    if global_stats is not None and global_stats['mode'] == 'zscore':
+        inp_val = (inp_resized - global_stats['inp_mean']) / (global_stats['inp_std'] + 1e-8)
+    elif global_stats is not None:
         inp_val = (inp_resized - global_stats['inp_min']) / (global_stats['inp_max'] - global_stats['inp_min'] + 1e-8)
     else:
         inp_val = normalize_map(inp_resized)
@@ -92,7 +94,9 @@ def combine_heatmaps(inp_dir, cpr_dir, fname, save_size, inp_weight, cpr_weight,
 
     if cpr_map is not None:
         cpr_resized = cv2.resize(cpr_map, (save_size, save_size))
-        if global_stats is not None:
+        if global_stats is not None and global_stats['mode'] == 'zscore':
+            cpr_val = (cpr_resized - global_stats['cpr_mean']) / (global_stats['cpr_std'] + 1e-8)
+        elif global_stats is not None:
             cpr_val = (cpr_resized - global_stats['cpr_min']) / (global_stats['cpr_max'] - global_stats['cpr_min'] + 1e-8)
         else:
             cpr_val = normalize_map(cpr_resized)
@@ -102,10 +106,12 @@ def combine_heatmaps(inp_dir, cpr_dir, fname, save_size, inp_weight, cpr_weight,
         return inp_val, False
 
 
-def compute_global_stats(inp_val_dir, cpr_val_dir, categories, save_size):
-    """Compute global min/max per model across all validation heatmaps."""
-    inp_min, inp_max = float('inf'), float('-inf')
-    cpr_min, cpr_max = float('inf'), float('-inf')
+def compute_global_stats(inp_val_dir, cpr_val_dir, categories, save_size, mode='minmax'):
+    """Compute global normalization stats per model across all validation heatmaps.
+    mode='minmax': returns min/max for [0,1] normalization
+    mode='zscore': returns mean/std for z-score normalization"""
+    inp_pixels = []
+    cpr_pixels = []
 
     for category in categories:
         inp_good = os.path.join(inp_val_dir, category, 'good')
@@ -114,17 +120,32 @@ def compute_global_stats(inp_val_dir, cpr_val_dir, categories, save_size):
         for npy_path in sorted(glob(os.path.join(inp_good, '*_heatmap_raw.npy'))):
             amap = np.load(npy_path)
             amap = cv2.resize(amap, (save_size, save_size))
-            inp_min = min(inp_min, amap.min())
-            inp_max = max(inp_max, amap.max())
+            inp_pixels.append(amap.flatten())
 
         for npy_path in sorted(glob(os.path.join(cpr_good, '*_heatmap_raw.npy'))):
             amap = np.load(npy_path)
             amap = cv2.resize(amap, (save_size, save_size))
-            cpr_min = min(cpr_min, amap.min())
-            cpr_max = max(cpr_max, amap.max())
+            cpr_pixels.append(amap.flatten())
 
-    print(f"  Global stats — INP: [{inp_min:.4f}, {inp_max:.4f}], CPR: [{cpr_min:.4f}, {cpr_max:.4f}]")
-    return {'inp_min': inp_min, 'inp_max': inp_max, 'cpr_min': cpr_min, 'cpr_max': cpr_max}
+    inp_all = np.concatenate(inp_pixels)
+    cpr_all = np.concatenate(cpr_pixels)
+
+    if mode == 'zscore':
+        stats = {
+            'mode': 'zscore',
+            'inp_mean': inp_all.mean(), 'inp_std': inp_all.std(),
+            'cpr_mean': cpr_all.mean(), 'cpr_std': cpr_all.std(),
+        }
+        print(f"  Global z-score — INP: mean={stats['inp_mean']:.4f}, std={stats['inp_std']:.4f} | CPR: mean={stats['cpr_mean']:.4f}, std={stats['cpr_std']:.4f}")
+    else:
+        stats = {
+            'mode': 'minmax',
+            'inp_min': inp_all.min(), 'inp_max': inp_all.max(),
+            'cpr_min': cpr_all.min(), 'cpr_max': cpr_all.max(),
+        }
+        print(f"  Global min/max — INP: [{stats['inp_min']:.4f}, {stats['inp_max']:.4f}] | CPR: [{stats['cpr_min']:.4f}, {stats['cpr_max']:.4f}]")
+
+    return stats
 
 
 def fit_evt_from_validation(inp_val_dir, cpr_val_dir, category, save_size, inp_weight, cpr_weight, global_stats=None):
@@ -185,8 +206,9 @@ def main(args):
         if not args.inp_val_dir or not args.cpr_val_dir:
             print("ERROR: --evt requires --inp_val_dir and --cpr_val_dir")
             sys.exit(1)
-        print("Computing global normalization stats from validation...")
-        global_stats = compute_global_stats(args.inp_val_dir, args.cpr_val_dir, categories, save_size)
+        norm_mode = 'zscore' if args.zscore else 'minmax'
+        print(f"Computing global normalization stats from validation ({norm_mode})...")
+        global_stats = compute_global_stats(args.inp_val_dir, args.cpr_val_dir, categories, save_size, mode=norm_mode)
         print("Fitting EVT from validation heatmaps...")
         for category in categories:
             params = fit_evt_from_validation(
@@ -317,6 +339,7 @@ if __name__ == '__main__':
     parser.add_argument('--inp_weight', type=float, default=1.0, help='Weight for INP-Former heatmap')
     parser.add_argument('--cpr_weight', type=float, default=1.0, help='Weight for CPR heatmap')
     parser.add_argument('--top_percent', type=float, default=None, help='Top X%% threshold. If not set, uses Otsu.')
+    parser.add_argument('--zscore', action='store_true', help='Use z-score normalization instead of min/max (requires --evt)')
     parser.add_argument('--evt', action='store_true', help='Use EVT thresholding (fit on validation heatmaps)')
     parser.add_argument('--evt_fdr', type=float, default=0.01, help='FDR rate for EVT thresholding (default 0.01)')
     parser.add_argument('--adaptive_fdr', action='store_true', help='Scale FDR per category based on GEV scale parameter')
