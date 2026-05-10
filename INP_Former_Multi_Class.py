@@ -433,6 +433,47 @@ def test_one_category(args, item, data_transform, gt_transform, device, use_tili
     return results
 
 
+def validate_one_category(args, item, data_transform, device, use_tiling, tile_overlap):
+    """Run model on validation/good images and save heatmaps only (no metrics)."""
+    from utils import cal_anomaly_maps, get_gaussian_kernel
+
+    model, embed_dim, *_ = build_model(args, device)
+    cat_save_dir = os.path.join(args.save_dir, args.save_name, item)
+    model.load_state_dict(torch.load(os.path.join(cat_save_dir, 'model.pth')), strict=True)
+    model.eval()
+
+    val_path = os.path.join(args.data_path, item, 'validation', 'good')
+    if not os.path.isdir(val_path):
+        print_fn(f'{item}: no validation/good dir found, skipping')
+        return
+
+    val_data = ImageFolder(root=os.path.join(args.data_path, item, 'validation'), transform=data_transform)
+    val_dataloader = torch.utils.data.DataLoader(val_data, batch_size=args.batch_size, shuffle=False, num_workers=4)
+
+    gaussian_kernel = get_gaussian_kernel(kernel_size=5, sigma=4).to(device)
+    # Save to val_heatmaps/ (separate from test heatmaps/)
+    out_dir = os.path.join(args.save_dir, args.save_name, 'val_heatmaps', item, 'good')
+    os.makedirs(out_dir, exist_ok=True)
+
+    sample_idx = 0
+    with torch.no_grad():
+        for imgs, _ in tqdm(val_dataloader, desc=f'Validation maps: {item}', ncols=80):
+            imgs = imgs.to(device)
+            output = model(imgs)
+            en, de = output[0], output[1]
+            anomaly_map, _ = cal_anomaly_maps(en, de, args.crop_size)
+            anomaly_map = gaussian_kernel(anomaly_map)
+
+            for i in range(imgs.shape[0]):
+                fpath = val_data.samples[sample_idx][0]
+                fname = os.path.splitext(os.path.basename(fpath))[0]
+                raw_amap = anomaly_map[i, 0].cpu().numpy()
+                np.save(os.path.join(out_dir, f'{fname}_heatmap_raw.npy'), raw_amap)
+                sample_idx += 1
+
+    print_fn(f'{item}: {sample_idx} validation heatmaps saved to {out_dir}')
+
+
 def main(args):
     setup_seed(1)
 
@@ -461,12 +502,15 @@ def main(args):
         print_fn(f'\n{"="*20} {item} {"="*20}')
         if args.phase == 'train':
             results = train_one_category(args, item, data_transform, gt_transform, device, use_tiling, tile_overlap)
+            all_results.append(results)
         elif args.phase == 'test':
             results = test_one_category(args, item, data_transform, gt_transform, device, use_tiling, tile_overlap, embed_dim)
-        all_results.append(results)
+            all_results.append(results)
+        elif args.phase == 'validation':
+            validate_one_category(args, item, data_transform, device, use_tiling, tile_overlap)
 
     # Print mean across all categories
-    if len(all_results) > 1:
+    if all_results and len(all_results) > 1:
         mean_results = np.mean(all_results, axis=0)
         print_fn('\nMean: I-Auroc:{:.4f}, I-AP:{:.4f}, I-F1:{:.4f}, P-AUROC:{:.4f}, P-AP:{:.4f}, P-F1:{:.4f}, P-AUPRO:{:.4f}'.format(*mean_results))
 

@@ -29,6 +29,7 @@ from glob import glob
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from scipy.stats import genextreme
 
 
 def normalize_map(amap):
@@ -61,13 +62,100 @@ def load_heatmap_npy(path):
     return None
 
 
+def combine_heatmaps(inp_dir, cpr_dir, fname, save_size, inp_weight, cpr_weight):
+    """Load and combine INP-Former + CPR heatmaps for a single image.
+    Returns the combined (weighted average) heatmap, or None if INP heatmap not found."""
+    # Load INP-Former heatmap (.npy preferred, PNG fallback)
+    inp_npy = os.path.join(inp_dir, f'{fname}_heatmap_raw.npy')
+    inp_map = load_heatmap_npy(inp_npy)
+    if inp_map is None:
+        inp_path = os.path.join(inp_dir, f'{fname}_heatmap.png')
+        inp_map = load_heatmap(inp_path)
+    if inp_map is None:
+        return None, False
+
+    inp_resized = cv2.resize(inp_map, (save_size, save_size))
+    inp_norm = normalize_map(inp_resized)
+
+    # Load CPR heatmap (.npy preferred, PNG fallback)
+    cpr_npy = os.path.join(cpr_dir, f'{fname}_heatmap_raw.npy')
+    cpr_map = load_heatmap_npy(cpr_npy)
+    if cpr_map is None:
+        cpr_path = os.path.join(cpr_dir, f'{fname}_heatmap.png')
+        cpr_map = load_heatmap(cpr_path)
+
+    if cpr_map is not None:
+        cpr_resized = cv2.resize(cpr_map, (save_size, save_size))
+        cpr_norm = normalize_map(cpr_resized)
+        combined = (inp_weight * inp_norm + cpr_weight * cpr_norm) / (inp_weight + cpr_weight)
+        return combined, True
+    else:
+        return inp_norm, False
+
+
+def fit_evt_from_validation(inp_val_dir, cpr_val_dir, category, save_size, inp_weight, cpr_weight):
+    """Fit GEV distribution on combined validation/good heatmaps for a category.
+    Returns (shape, loc, scale) EVT params."""
+    inp_val_good = os.path.join(inp_val_dir, category, 'good')
+    cpr_val_good = os.path.join(cpr_val_dir, category, 'good')
+
+    if not os.path.isdir(inp_val_good):
+        print(f"  WARNING: No INP validation heatmaps for {category} at {inp_val_good}")
+        return None
+
+    # Find all validation heatmaps (.npy only)
+    inp_npy_files = sorted(glob(os.path.join(inp_val_good, '*_heatmap_raw.npy')))
+
+    all_pixel_scores = []
+    for npy_path in inp_npy_files:
+        fname = os.path.basename(npy_path).replace('_heatmap_raw.npy', '')
+        combined, _ = combine_heatmaps(inp_val_good, cpr_val_good, fname, save_size, inp_weight, cpr_weight)
+        if combined is not None:
+            all_pixel_scores.append(combined.flatten())
+
+    if not all_pixel_scores:
+        print(f"  WARNING: No validation heatmaps combined for {category}")
+        return None
+
+    all_pixel_scores = np.concatenate(all_pixel_scores)
+    # Fit GEV to the tail (top 5% of normal scores), sample max 50k for speed
+    tail_threshold = np.percentile(all_pixel_scores, 95)
+    tail_scores = all_pixel_scores[all_pixel_scores >= tail_threshold]
+    if len(tail_scores) > 50000:
+        tail_scores = np.random.choice(tail_scores, 50000, replace=False)
+    print(f'  {category}: fitting GEV on {len(tail_scores)} tail samples...')
+    shape, loc, scale = genextreme.fit(tail_scores)
+    print(f'  {category}: EVT fit: shape={shape:.4f}, loc={loc:.6f}, scale={scale:.6f}')
+    return shape, loc, scale
+
+
+def evt_threshold(combined_map, evt_params, fdr=0.01):
+    """Apply EVT-based thresholding. Pixels with p-value < fdr are anomalous."""
+    shape, loc, scale = evt_params
+    p_values = 1 - genextreme.cdf(combined_map, shape, loc=loc, scale=scale)
+    return ((p_values < fdr) * 255).astype(np.uint8)
+
+
 def main(args):
     categories = sorted(os.listdir(args.inp_dir))
     if args.item:
         categories = [c for c in categories if c == args.item]
 
     save_size = args.save_size
-    all_categories_results = []
+
+    # Fit EVT params per category from validation heatmaps
+    evt_params_per_cat = {}
+    if args.evt:
+        if not args.inp_val_dir or not args.cpr_val_dir:
+            print("ERROR: --evt requires --inp_val_dir and --cpr_val_dir")
+            sys.exit(1)
+        print("Fitting EVT from validation heatmaps...")
+        for category in categories:
+            params = fit_evt_from_validation(
+                args.inp_val_dir, args.cpr_val_dir, category,
+                save_size, args.inp_weight, args.cpr_weight)
+            if params is not None:
+                evt_params_per_cat[category] = params
 
     for category in categories:
         inp_cat_dir = os.path.join(args.inp_dir, category)
@@ -79,6 +167,7 @@ def main(args):
 
         sub_dirs = sorted(os.listdir(inp_cat_dir))
         n_combined = 0
+        cat_evt = evt_params_per_cat.get(category)
 
         for sub_dir in sub_dirs:
             inp_sub = os.path.join(inp_cat_dir, sub_dir)
@@ -86,46 +175,27 @@ def main(args):
             out_sub = os.path.join(args.out_dir, category, sub_dir)
             os.makedirs(out_sub, exist_ok=True)
 
-            # Find INP-Former heatmaps
+            # Find INP-Former heatmaps (exclude seg_heatmap files)
             inp_heatmaps = sorted(glob(os.path.join(inp_sub, '*_heatmap.png')))
+            inp_heatmaps = [p for p in inp_heatmaps if '_seg_heatmap.png' not in p]
 
             for inp_path in inp_heatmaps:
                 fname = os.path.basename(inp_path).replace('_heatmap.png', '')
 
-                # Load INP-Former heatmap (.npy preferred, PNG fallback)
-                inp_npy = os.path.join(inp_sub, f'{fname}_heatmap_raw.npy')
-                inp_map = load_heatmap_npy(inp_npy)
-                if inp_map is None:
-                    inp_map = load_heatmap(inp_path)
-                if inp_map is None:
+                combined, was_combined = combine_heatmaps(
+                    inp_sub, cpr_sub, fname, save_size, args.inp_weight, args.cpr_weight)
+                if combined is None:
                     continue
-
-                # Load CPR heatmap (.npy preferred, PNG fallback)
-                cpr_npy = os.path.join(cpr_sub, f'{fname}_heatmap_raw.npy')
-                cpr_map = load_heatmap_npy(cpr_npy)
-                if cpr_map is None:
-                    cpr_path = os.path.join(cpr_sub, f'{fname}_heatmap.png')
-                    cpr_map = load_heatmap(cpr_path)
-
-                # Resize both to common size
-                inp_resized = cv2.resize(inp_map, (save_size, save_size))
-                inp_norm = normalize_map(inp_resized)
-
-                if cpr_map is not None:
-                    cpr_resized = cv2.resize(cpr_map, (save_size, save_size))
-                    cpr_norm = normalize_map(cpr_resized)
-                    # Weighted average (configurable)
-                    combined = args.inp_weight * inp_norm + args.cpr_weight * cpr_norm
-                    combined = combined / (args.inp_weight + args.cpr_weight)
+                if was_combined:
                     n_combined += 1
-                else:
-                    combined = inp_norm
 
                 # Save combined heatmap
                 plt.imsave(os.path.join(out_sub, f'{fname}_heatmap.png'), combined, cmap='jet')
 
                 # Binary mask
-                if args.top_percent is not None:
+                if cat_evt is not None:
+                    pred_mask = evt_threshold(combined, cat_evt, fdr=args.evt_fdr)
+                elif args.top_percent is not None:
                     threshold = np.percentile(combined, 100 - args.top_percent)
                     pred_mask = ((combined >= threshold) * 255).astype(np.uint8)
                 else:
@@ -142,7 +212,8 @@ def main(args):
 
                 plt.close('all')
 
-        print(f"  {category}: {n_combined} images combined (INP + CPR)")
+        print(f"  {category}: {n_combined} images combined (INP + CPR)" +
+              (f" [EVT fdr={args.evt_fdr}]" if cat_evt else ""))
 
     print(f"\nEnsemble heatmaps saved to {args.out_dir}/")
 
@@ -158,6 +229,10 @@ if __name__ == '__main__':
     parser.add_argument('--inp_weight', type=float, default=1.0, help='Weight for INP-Former heatmap')
     parser.add_argument('--cpr_weight', type=float, default=1.0, help='Weight for CPR heatmap')
     parser.add_argument('--top_percent', type=float, default=None, help='Top X%% threshold. If not set, uses Otsu.')
+    parser.add_argument('--evt', action='store_true', help='Use EVT thresholding (fit on validation heatmaps)')
+    parser.add_argument('--evt_fdr', type=float, default=0.01, help='FDR rate for EVT thresholding (default 0.01)')
+    parser.add_argument('--inp_val_dir', type=str, default=None, help='Path to INP-Former validation heatmaps dir')
+    parser.add_argument('--cpr_val_dir', type=str, default=None, help='Path to CPR validation heatmaps dir')
 
     args = parser.parse_args()
     main(args)
