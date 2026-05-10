@@ -195,21 +195,23 @@ def main(args):
             if params is not None:
                 evt_params_per_cat[category] = params
 
-        # Compute per-category FDR scaled by GEV scale parameter
+        # Compute per-category FDR scaled by GEV shape parameter
+        # More negative shape = bounded tail = safe to use higher FDR
+        # Shape closer to 0 = heavy tail = need stricter FDR
         if args.adaptive_fdr and evt_params_per_cat:
             alpha = args.adaptive_strength
-            scales = [p[2] for p in evt_params_per_cat.values()]
-            median_scale = np.median(scales)
-            print(f"\nAdaptive FDR (base={args.evt_fdr}, strength={alpha}, median_scale={median_scale:.6f}):")
+            abs_shapes = [abs(p[0]) for p in evt_params_per_cat.values()]
+            median_shape = np.median(abs_shapes)
+            print(f"\nAdaptive FDR (base={args.evt_fdr}, strength={alpha}, median_|shape|={median_shape:.4f}):")
             for cat, params in evt_params_per_cat.items():
-                cat_scale = params[2]
-                # Pure adaptive: scale inversely with GEV scale
-                raw_fdr = args.evt_fdr * (median_scale / cat_scale)
+                cat_abs_shape = abs(params[0])
+                # Pure adaptive: scale proportionally with |shape|
+                raw_fdr = args.evt_fdr * (cat_abs_shape / median_shape)
                 # Blend with base: alpha=0 → uniform, alpha=1 → full adaptive
                 cat_fdr = alpha * raw_fdr + (1 - alpha) * args.evt_fdr
                 cat_fdr = np.clip(cat_fdr, 0.01, 0.5)
                 evt_fdr_per_cat[cat] = cat_fdr
-                print(f"  {cat}: scale={cat_scale:.6f}, fdr={cat_fdr:.4f}")
+                print(f"  {cat}: |shape|={cat_abs_shape:.4f}, fdr={cat_fdr:.4f}")
         else:
             for cat in evt_params_per_cat:
                 evt_fdr_per_cat[cat] = args.evt_fdr
