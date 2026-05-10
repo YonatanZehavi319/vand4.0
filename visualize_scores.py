@@ -67,7 +67,8 @@ def main():
                     if not os.path.exists(gt_path):
                         continue
                     gt = cv.imread(gt_path, cv.IMREAD_GRAYSCALE)
-                    gt = cv.resize(gt, (resize, resize))
+                    sz = binary.shape[0]
+                    gt = cv.resize(gt, (sz, sz))
                     pred = (binary > 127).astype(int).flatten()
                     gt_flat = (gt > 127).astype(int).flatten()
                     tp = (pred * gt_flat).sum()
